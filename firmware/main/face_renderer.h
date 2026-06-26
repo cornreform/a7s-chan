@@ -10,7 +10,7 @@
 #define CORE3_LCD_CS    GPIO_NUM_5
 #define CORE3_LCD_MOSI  GPIO_NUM_6
 #define CORE3_LCD_SCK   GPIO_NUM_7
-#define CORE3_LCD_DC    GPIO_NUM_8
+#define CORE3_LCD_DC    GPIO_NUM_35  // Shared with SPI MISO!
 #define CORE3_LCD_RST   GPIO_NUM_9
 #define CORE3_LCD_BL    GPIO_NUM_38
 

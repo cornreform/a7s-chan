@@ -36,10 +36,11 @@ void FaceRenderer::lcd_init() {
     gpio_set_level(GPIO_NUM_3, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // Initialize SPI bus (only if not already initialized)
+    // Initialize SPI bus
+    // NOTE: MISO = -1 to prevent SPI from claiming GPIO35 (shared with LCD_DC)
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = CORE3_LCD_MOSI;
-    bus_cfg.miso_io_num = -1;
+    bus_cfg.miso_io_num = -1;  // CRITICAL: GPIO35 is LCD_DC, not MISO!
     bus_cfg.sclk_io_num = CORE3_LCD_SCK;
     bus_cfg.max_transfer_sz = LCD_WIDTH * 2 + 8;
 
@@ -82,15 +83,16 @@ void FaceRenderer::lcd_init() {
 }
 
 void FaceRenderer::lcd_write_cmd(uint8_t cmd) {
-    gpio_set_level(CORE3_LCD_DC, 0);
-    spi_transaction_t t = { .length = 8, .tx_buffer = &cmd };
-    spi_device_transmit(m_spi, &t);
+    // Force GPIO35 back to GPIO output (SPI may have overridden it as MISO)
+    gpio_set_direction(CORE3_LCD_DC, GPIO_MODE_OUTPUT);
+    gpio_set_level(CORE3_LCD_DC, 0);  // Command mode
+    spi_device_polling_transmit(m_spi, &(spi_transaction_t){ .length = 8, .tx_buffer = &cmd });
 }
 
 void FaceRenderer::lcd_write_data(const uint8_t* data, size_t len) {
-    gpio_set_level(CORE3_LCD_DC, 1);
-    spi_transaction_t t = { .length = len * 8, .tx_buffer = data };
-    spi_device_transmit(m_spi, &t);
+    gpio_set_direction(CORE3_LCD_DC, GPIO_MODE_OUTPUT);
+    gpio_set_level(CORE3_LCD_DC, 1);  // Data mode
+    spi_device_polling_transmit(m_spi, &(spi_transaction_t){ .length = len * 8, .tx_buffer = data });
 }
 
 void FaceRenderer::lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
@@ -103,12 +105,12 @@ void FaceRenderer::lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_
 
 void FaceRenderer::send_line(int y) {
     lcd_set_window(0, y, LCD_WIDTH - 1, y);
+    gpio_set_direction(CORE3_LCD_DC, GPIO_MODE_OUTPUT);
     gpio_set_level(CORE3_LCD_DC, 1);
-    spi_transaction_t t = {
+    spi_device_polling_transmit(m_spi, &(spi_transaction_t){
         .length = LCD_WIDTH * 16,
         .tx_buffer = m_line_buf,
-    };
-    spi_device_transmit(m_spi, &t);
+    });
 }
 
 // ── Public API ────────────────────────────────────────────────
