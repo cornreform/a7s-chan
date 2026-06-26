@@ -16,7 +16,7 @@
 
 // Maximum UDP packet sizes
 #define UDP_MAX_PACKET_SIZE   2048
-#define UDP_CMD_BUFFER_SIZE   4096
+#define UDP_CMD_BUFFER_SIZE   512
 
 // Status message interval (ms)
 #define STATUS_INTERVAL_MS   100
