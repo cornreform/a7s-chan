@@ -20,9 +20,12 @@ bool FaceRenderer::begin() {
     esp_lcd_panel_io_handle_t io = NULL;
     esp_err_t err = bsp_display_new(&cfg, &m_panel, &io);
     if (err != ESP_OK) { ESP_LOGE(TAG, "bsp_display_new failed: %d", err); return false; }
+    
+    // Force backlight on via direct GPIO + BSP
+    gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_38, 1);
     bsp_display_backlight_on();
-    err = esp_lcd_panel_disp_on_off(m_panel, true);
-    if (err != ESP_OK) ESP_LOGE(TAG, "disp_on_off failed: %d", err);
+    esp_lcd_panel_disp_on_off(m_panel, true);
     ESP_LOGI(TAG, "Display ready via BSP");
     // Fill screen RED using line buffer
     for (int i = 0; i < LCD_WIDTH; i++) m_line_buf[i] = 0xF800;
