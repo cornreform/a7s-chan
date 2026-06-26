@@ -355,10 +355,11 @@ static void command_handler(const udp_command_t& cmd, void* user_arg) {
                      cmd.screen.brightness, cmd.screen.clear);
 
             if (cmd.screen.clear) {
-                g_face_renderer.clear(TFT_BLACK);
+                g_face_renderer.clear(0x0000);
             }
             if (cmd.screen.brightness > 0) {
-                g_face_renderer.display()->setBrightness(cmd.screen.brightness);
+                // Brightness control via backlight GPIO
+                gpio_set_level((gpio_num_t)38, cmd.screen.brightness > 128 ? 1 : 0);
             }
             break;
         }

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include "expressions.h"
 #include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_timer.h"
 
 // M5Stack CoreS3 LCD pins
 #define CORE3_LCD_CS    GPIO_NUM_5
