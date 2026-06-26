@@ -285,7 +285,10 @@ void UDPClient::recv_task_func(void* arg) {
             // Parse command JSON
             udp_command_t cmd;
             memset(&cmd, 0, sizeof(cmd));
-            snprintf(cmd.raw_json, sizeof(cmd.raw_json), "%s", buffer);
+            size_t copy_len = strlen(buffer);
+            if (copy_len >= sizeof(cmd.raw_json)) copy_len = sizeof(cmd.raw_json) - 1;
+            memcpy(cmd.raw_json, buffer, copy_len);
+            cmd.raw_json[copy_len] = '\0';
 
             if (self->parse_json(buffer, &cmd)) {
                 if (self->m_cmd_callback) {
