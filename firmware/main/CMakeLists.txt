@@ -24,5 +24,4 @@ idf_component_register(
         spi_flash
         newlib
         fatfs
-        lovyangfx
 )

@@ -1,61 +1,154 @@
 #include "face_renderer.h"
+#include "esp_log.h"
+#include "esp_check.h"
+#include "driver/spi_master.h"
+#include <cstring>
 #include <cmath>
-#include <cstdio>
 
-// M5Stack CoreS3 pin definitions for display
-#define CORE3_LCD_CS     3   // CS
-#define CORE3_LCD_SCK    7   // SCLK (SPI)
-#define CORE3_LCD_MOSI   6   // MOSI (SPI)
-#define CORE3_LCD_DC     2   // DC
-#define CORE3_LCD_RST    1   // RST
-#define CORE3_LCD_BL     40  // Backlight
-#define CORE3_LCD_MISO   8   // MISO (for reading, optional)
+static const char* TAG = "FaceRenderer";
 
-// Touch pins (FT6336 on M5Stack CoreS3)
-#define CORE3_TOUCH_SDA  12
-#define CORE3_TOUCH_SCL  11
-#define CORE3_TOUCH_RST  10
-#define CORE3_TOUCH_INT  9
+// ── Constructor / Destructor ──────────────────────────────────
 
 FaceRenderer::FaceRenderer()
     : m_current_id(EXPR_IDLE)
     , m_target_id(EXPR_IDLE)
     , m_tweening(false)
-    , m_tween_start_ms(0)
-    , m_tween_duration_ms(0)
+    , m_tween_start(0)
+    , m_tween_duration(0)
+    , m_last_blink(0)
+    , m_eye_state(true)
+    , m_fb(nullptr)
+    , m_spi(nullptr)
 {
-    // Initialize default params from idle expression via API
     const expression_params_t* neutral = get_expression_params(EXPR_IDLE);
     m_current_params = *neutral;
     m_target_params = *neutral;
 }
 
 FaceRenderer::~FaceRenderer() {
+    if (m_fb) free(m_fb);
+    if (m_spi) {
+        spi_bus_remove_device(m_spi);
+    }
 }
 
+// ── LCD Init ──────────────────────────────────────────────────
+
+void FaceRenderer::lcd_init() {
+    // Initialize SPI bus
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = CORE3_LCD_MOSI,
+        .miso_io_num = -1,
+        .sclk_io_num = CORE3_LCD_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2 + 8,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    // Attach LCD device
+    spi_device_interface_config_t dev_cfg = {
+        .mode = 0,
+        .clock_speed_hz = 40 * 1000 * 1000,  // 40MHz
+        .spics_io_num = CORE3_LCD_CS,
+        .queue_size = 1,
+    };
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev_cfg, &m_spi));
+
+    // Reset LCD
+    gpio_set_direction(CORE3_LCD_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level(CORE3_LCD_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(CORE3_LCD_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // ILI9342C init sequence
+    lcd_write_cmd(0x01);  // Software reset
+    vTaskDelay(pdMS_TO_TICKS(10));
+    lcd_write_cmd(0x11);  // Sleep out
+    vTaskDelay(pdMS_TO_TICKS(120));
+    lcd_write_cmd(0x36);  // MADCTL
+    uint8_t madctl = 0x08;  // RGB order
+    lcd_write_data(&madctl, 1);
+    lcd_write_cmd(0x3A);  // COLMOD: 16-bit
+    uint8_t colmod = 0x55;
+    lcd_write_data(&colmod, 1);
+    lcd_write_cmd(0x21);  // Display inversion on
+    lcd_write_cmd(0x29);  // Display on
+
+    // Backlight
+    gpio_set_direction(CORE3_LCD_BL, GPIO_MODE_OUTPUT);
+    gpio_set_level(CORE3_LCD_BL, 1);
+
+    // Allocate framebuffer (320*240*2 bytes = 150KB)
+    m_fb = (uint16_t*)heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * 2, MALLOC_CAP_DMA);
+    if (!m_fb) {
+        ESP_LOGE(TAG, "Failed to allocate framebuffer");
+        m_fb = (uint16_t*)malloc(LCD_WIDTH * LCD_HEIGHT * 2);
+    }
+}
+
+void FaceRenderer::lcd_write_cmd(uint8_t cmd) {
+    gpio_set_level(CORE3_LCD_DC, 0);  // Command mode
+    spi_transaction_t t = {
+        .length = 8,
+        .tx_buffer = &cmd,
+    };
+    spi_device_transmit(m_spi, &t);
+}
+
+void FaceRenderer::lcd_write_data(const uint8_t* data, size_t len) {
+    gpio_set_level(CORE3_LCD_DC, 1);  // Data mode
+    spi_transaction_t t = {
+        .length = len * 8,
+        .tx_buffer = data,
+    };
+    spi_device_transmit(m_spi, &t);
+}
+
+void FaceRenderer::lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
+    uint8_t col_data[4] = { (uint8_t)(x1 >> 8), (uint8_t)x1, (uint8_t)(x2 >> 8), (uint8_t)x2 };
+    uint8_t row_data[4] = { (uint8_t)(y1 >> 8), (uint8_t)y1, (uint8_t)(y2 >> 8), (uint8_t)y2 };
+    lcd_write_cmd(0x2A);  // CASET
+    lcd_write_data(col_data, 4);
+    lcd_write_cmd(0x2B);  // RASET
+    lcd_write_data(row_data, 4);
+    lcd_write_cmd(0x2C);  // RAMWR
+}
+
+void FaceRenderer::lcd_flush() {
+    lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+    gpio_set_level(CORE3_LCD_DC, 1);
+    spi_transaction_t t = {
+        .length = LCD_WIDTH * LCD_HEIGHT * 16,
+        .tx_buffer = m_fb,
+    };
+    spi_device_transmit(m_spi, &t);
+}
+
+void FaceRenderer::draw_pixel(uint16_t x, uint16_t y, uint16_t color) {
+    if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
+    m_fb[y * LCD_WIDTH + x] = color;
+}
+
+// ── Public API ────────────────────────────────────────────────
+
 bool FaceRenderer::begin() {
-    // LovyanGFX auto-detects M5Stack CoreS3
-    m_lcd.begin();
-    m_lcd.setRotation(1);
-    m_lcd.setBrightness(200);
-    m_lcd.fillScreen(TFT_BLACK);
-
-    // Initial render
+    lcd_init();
+    clear(0x0000);
+    lcd_flush();
     render();
-
     return true;
 }
 
 void FaceRenderer::set_expression(expression_id_t expr_id) {
     if (expr_id >= EXPR_COUNT) return;
-
     m_current_id = expr_id;
     m_target_id = expr_id;
     const expression_params_t* params = get_expression_params(expr_id);
     m_current_params = *params;
     m_target_params = *params;
     m_tweening = false;
-
     render();
 }
 
@@ -68,358 +161,245 @@ bool FaceRenderer::set_expression_by_name(const char* name) {
 
 void FaceRenderer::tween_to(expression_id_t target_id, uint32_t duration_ms) {
     if (target_id >= EXPR_COUNT) return;
-
     m_target_id = target_id;
-    const expression_params_t* params = get_expression_params(target_id);
-    m_target_params = *params;
-    m_tween_duration_ms = duration_ms;
-    m_tween_start_ms = esp_timer_get_time() / 1000; // convert us to ms
+    m_target_params = *get_expression_params(target_id);
+    m_tween_start = (uint32_t)(esp_timer_get_time() / 1000);
+    m_tween_duration = duration_ms;
     m_tweening = true;
 }
 
-void FaceRenderer::set_custom_params(const expression_params_t& params) {
-    m_current_params = params;
-    m_target_params = params;
-    m_current_id = EXPR_COUNT; // custom, not in DB
-    m_target_id = EXPR_COUNT;
-    m_tweening = false;
-    render();
-}
-
-void FaceRenderer::update(uint32_t now_ms) {
-    if (!m_tweening) return;
-
-    uint32_t elapsed = now_ms - m_tween_start_ms;
-    float t = (m_tween_duration_ms > 0)
-        ? static_cast<float>(elapsed) / static_cast<float>(m_tween_duration_ms)
-        : 1.0f;
-
-    if (t >= 1.0f) {
-        t = 1.0f;
-        m_tweening = false;
-        m_current_id = m_target_id;
+void FaceRenderer::update(uint32_t current_time_ms) {
+    // Handle tween
+    if (m_tweening) {
+        uint32_t elapsed = current_time_ms - m_tween_start;
+        if (elapsed >= m_tween_duration) {
+            m_tweening = false;
+            m_current_params = m_target_params;
+            m_current_id = m_target_id;
+        } else {
+            float t = (float)elapsed / (float)m_tween_duration;
+            lerp_expression(&m_current_params, &m_target_params, t, &m_current_params);
+        }
+        render();
     }
 
-    // Lerp between current and target parameters using expressions.h API
-    expression_params_t interpolated;
-    lerp_expression(&m_current_params, &m_target_params, t, &interpolated);
-    m_current_params = interpolated;
-
-    render();
+    // Auto-blink every 3 seconds
+    if (current_time_ms - m_last_blink > 3000) {
+        m_last_blink = current_time_ms;
+        m_eye_state = !m_eye_state;
+        render();
+    }
 }
 
 void FaceRenderer::render() {
-    m_lcd.startWrite();
-
-    // Clear screen
-    m_lcd.fillScreen(TFT_BLACK);
-
-    int cx = center_x();
-    int cy = center_y();
-
-    // Draw order: blush -> eyes -> pupils/hearts -> eyebrows -> tears -> mouth
-    draw_blush(cx, cy, m_current_params);
-    draw_eye(cx, cy, m_current_params, true);   // left eye
-    draw_eye(cx, cy, m_current_params, false);  // right eye
-    draw_heart_eyes(cx, cy, m_current_params, true);
-    draw_heart_eyes(cx, cy, m_current_params, false);
-    draw_pupil(cx, cy, m_current_params, true);
-    draw_pupil(cx, cy, m_current_params, false);
-    draw_eyebrow(cx, cy, m_current_params, true);
-    draw_eyebrow(cx, cy, m_current_params, false);
-    draw_tears(cx, cy, m_current_params);
-    draw_mouth(cx, cy, m_current_params);
-
-    m_lcd.endWrite();
+    clear(0x0000);
+    draw_face_frame();
+    lcd_flush();
 }
 
 void FaceRenderer::clear(uint16_t color) {
-    m_lcd.fillScreen(color);
+    for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
+        m_fb[i] = color;
+    }
 }
 
-// ============================================================
-// Drawing implementations
-// ============================================================
+// ── Face drawing ──────────────────────────────────────────────
+
+void FaceRenderer::draw_face_frame() {
+    int cx = LCD_WIDTH / 2;   // 160
+    int cy = LCD_HEIGHT / 2;  // 120
+
+    // Draw face outline (large ellipse)
+    for (int y = -95; y <= 95; y++) {
+        for (int x = -85; x <= 85; x++) {
+            float rx = x / 85.0f;
+            float ry = y / 95.0f;
+            if (rx * rx + ry * ry <= 1.0f) {
+                draw_pixel(cx + x, cy + y, 0xFFDC);  // Skin tone
+            }
+        }
+    }
+
+    // Draw features
+    int eye_cx_left = cx - 35;
+    int eye_cx_right = cx + 35;
+    int eye_cy = cy - 15;
+
+    draw_eye(eye_cx_left, eye_cy, m_current_params, true);
+    draw_eye(eye_cx_right, eye_cy, m_current_params, false);
+
+    // Eyebrows
+    draw_eyebrow(eye_cx_left, eye_cy - 20, m_current_params, true);
+    draw_eyebrow(eye_cx_right, eye_cy - 20, m_current_params, false);
+
+    // Mouth
+    draw_mouth(cx, cy + 30, m_current_params);
+
+    // Blush
+    draw_blush(eye_cx_left - 10, eye_cy + 15, m_current_params);
+    draw_blush(eye_cx_right + 10, eye_cy + 15, m_current_params);
+
+    // Tears
+    if (m_current_params.tears > 0.1f) {
+        draw_tears(eye_cx_left, eye_cy, m_current_params);
+        draw_tears(eye_cx_right, eye_cy, m_current_params);
+    }
+}
 
 void FaceRenderer::draw_eye(int cx, int cy, const expression_params_t& p, bool is_left) {
-    // Eye dimensions driven by expression fields:
-    //   eye_open:  0.0=closed, 1.0=fully open
-    //   eye_width: 0.0=narrow slit, 1.0=wide
-    //   eye_height: 0.0=flat, 1.0=tall oval
-    int eye_spacing = 60;
-    int base_w = 50;
-    int base_h = 30;
-
-    // Compute actual eye dimensions from parameters
-    float openness = p.eye_open;           // 0..1 controls how open
-    float width_factor = 0.3f + 0.7f * p.eye_width;   // 0.3..1.0
-    float height_factor = 0.2f + 0.8f * p.eye_height; // 0.2..1.0
-
-    // When eye_open is near 0, the eye collapses to a slit
-    float open_factor = (openness < 0.01f) ? 0.01f : openness;
-
-    int ew = static_cast<int>(base_w * width_factor);
-    int eh = static_cast<int>(base_h * height_factor * open_factor);
-    if (eh < 2) eh = 2; // minimum height
-
-    // Eye position
-    int ex = cx + (is_left ? -eye_spacing : eye_spacing);
-    int ey = cy - 20;
-
-    // Draw eye white (sclera) — only if reasonably open
-    if (openness > 0.05f) {
-        m_lcd.fillEllipse(ex, ey, ew / 2, eh / 2, TFT_WHITE);
+    if (p.heart_eyes > 0.5f) {
+        draw_heart_eyes(cx, cy, p, is_left);
+        return;
     }
 
-    // Draw eye outline
-    m_lcd.drawEllipse(ex, ey, ew / 2, eh / 2, TFT_DARKGREY);
+    float open = p.eye_open;
+    int eye_w = 18;
+    int eye_h = (int)(12 * p.eye_height * open);
 
-    // If nearly closed, draw a horizontal line to indicate closed eye
-    if (openness < 0.1f) {
-        m_lcd.drawLine(ex - ew / 2, ey, ex + ew / 2, ey, TFT_WHITE);
+    if (eye_h < 2) {
+        // Closed eye (line)
+        for (int x = -eye_w; x <= eye_w; x++) {
+            draw_pixel(cx + x, cy, 0x0000);
+        }
+        return;
     }
+
+    // White of eye
+    for (int y = -eye_h; y <= eye_h; y++) {
+        for (int x = -eye_w; x <= eye_w; x++) {
+            float rx = x / (float)eye_w;
+            float ry = y / (float)eye_h;
+            if (rx * rx + ry * ry <= 1.0f) {
+                draw_pixel(cx + x, cy + y, 0xFFFF);  // White
+            }
+        }
+    }
+
+    // Pupil
+    draw_pupil(cx, cy, p, is_left);
 }
 
 void FaceRenderer::draw_pupil(int cx, int cy, const expression_params_t& p, bool is_left) {
-    // If heart_eyes is active, skip normal pupils (hearts drawn separately)
-    if (p.heart_eyes > 0.5f) return;
+    float open = p.eye_open;
+    int eye_h = (int)(12 * p.eye_height * open);
+    if (eye_h < 3) return;
 
-    int eye_spacing = 60;
-    int base_w = 50;
-    int base_h = 30;
+    // Pupil position follows gaze
+    int pupil_r = 5;
+    int px = cx + (int)(p.eye_width * 3 - 1.5f);
+    int py = cy + (int)(p.eye_height * 3 - 1.5f);
 
-    float openness = p.eye_open;
-    if (openness < 0.05f) return;
+    // Draw pupil (dark circle)
+    for (int y = -pupil_r; y <= pupil_r; y++) {
+        for (int x = -pupil_r; x <= pupil_r; x++) {
+            if (x * x + y * y <= pupil_r * pupil_r) {
+                draw_pixel(px + x, py + y, 0x0000);
+            }
+        }
+    }
 
-    float width_factor = 0.3f + 0.7f * p.eye_width;
-    float height_factor = 0.2f + 0.8f * p.eye_height;
-    float open_factor = (openness < 0.01f) ? 0.01f : openness;
-
-    int ew = static_cast<int>(base_w * width_factor);
-    int eh = static_cast<int>(base_h * height_factor * open_factor);
-    if (eh < 2) eh = 2;
-
-    int ex = cx + (is_left ? -eye_spacing : eye_spacing);
-    int ey = cy - 20;
-
-    // Pupil: fixed size relative to eye, centered
-    int pupil_r = static_cast<int>(7.0f * (0.8f + 0.2f * openness));
-    if (pupil_r < 2) pupil_r = 2;
-
-    // Centre pupil in the eye
-    int px = ex;
-    int py = ey;
-
-    // Draw iris ring
-    m_lcd.drawCircle(px, py, pupil_r + 3, TFT_DARKGREY);
-
-    // Draw pupil
-    m_lcd.fillCircle(px, py, pupil_r, TFT_BLACK);
-
-    // Pupil highlight for liveliness
-    int hl_r = pupil_r / 3;
-    if (hl_r < 1) hl_r = 1;
-    m_lcd.fillCircle(px + pupil_r / 3, py - pupil_r / 3, hl_r, TFT_WHITE);
-}
-
-void FaceRenderer::draw_heart_eyes(int cx, int cy, const expression_params_t& p, bool is_left) {
-    // heart_eyes: 0.0=normal, 1.0=full heart eyes
-    if (p.heart_eyes < 0.5f) return;
-
-    int eye_spacing = 60;
-    float openness = p.eye_open;
-    if (openness < 0.05f) return;
-
-    int ex = cx + (is_left ? -eye_spacing : eye_spacing);
-    int ey = cy - 20;
-
-    int heart_size = static_cast<int>(10 + 8 * p.heart_eyes);
-
-    // Draw a simple heart shape using two circles + triangle
-    uint16_t heart_color = rgb565(255, 60, 80);
-
-    // Left lobe
-    m_lcd.fillCircle(ex - heart_size / 3, ey - heart_size / 4, heart_size / 3, heart_color);
-    // Right lobe
-    m_lcd.fillCircle(ex + heart_size / 3, ey - heart_size / 4, heart_size / 3, heart_color);
-    // Bottom triangle
-    m_lcd.fillTriangle(
-        ex - heart_size / 3 - 1, ey - heart_size / 6,
-        ex + heart_size / 3 + 1, ey - heart_size / 6,
-        ex, ey + heart_size / 2,
-        heart_color
-    );
+    // Highlight
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            if (x * x + y * y <= 3) {
+                draw_pixel(px + x + 2, py + y - 2, 0xFFFF);
+            }
+        }
+    }
 }
 
 void FaceRenderer::draw_eyebrow(int cx, int cy, const expression_params_t& p, bool is_left) {
-    int eye_spacing = 60;
-    int brow_w = 34;
-    int brow_h = 5;
+    // Brow angle: 0=neutral, 0.5=up, 1.0=down
+    float brow_up = p.brow_angle;
+    float angle_deg = (brow_up - 0.5f) * 20.0f;  // -10 to +10 degrees
+    if (!is_left) angle_deg = -angle_deg;
 
-    int ex = cx + (is_left ? -eye_spacing : eye_spacing);
-    int ey = cy - 55; // above eyes
+    int brow_h = (int)(p.brow_height * 8);
+    int bx = cx;
+    int by = cy + brow_h;
 
-    // brow_angle: 0.0=neutral, 0.5=up, 1.0=down
-    // brow_height: 0.0=low, 1.0=high
-    // Map angle: positive = raised (happy), negative = lowered (angry)
-    float angle_map = (p.brow_angle - 0.5f) * 2.0f; // -1.0 to +1.0
-    // For left eye, mirror the angle direction for expression symmetry
-    float angle_deg = angle_map * 20.0f; // ±20 degrees max tilt
-    if (is_left) angle_deg = -angle_deg;
-
-    // Height offset: higher brow_height → brows raised
-    float height_offset = (p.brow_height - 0.5f) * 20.0f;
-
-    ey += static_cast<int>(height_offset);
-
-    float rad = angle_deg * 3.14159f / 180.0f;
-
-    int x1 = ex - brow_w / 2;
-    int y1 = ey;
-    int x2 = ex + brow_w / 2;
-    int y2 = ey + static_cast<int>(tan(rad) * brow_w);
-
-    // Draw brow as a thick line
-    m_lcd.drawLine(x1, y1, x2, y2, TFT_WHITE);
-    m_lcd.drawLine(x1, y1 + 1, x2, y2 + 1, TFT_WHITE);
-    m_lcd.drawLine(x1, y1 + 2, x2, y2 + 2, TFT_WHITE);
+    // Draw brow line
+    for (int x = -15; x <= 15; x++) {
+        int y_offset = (int)(x * angle_deg / 10.0f);
+        draw_pixel(bx + x, by + y_offset, 0x0000);
+    }
 }
 
 void FaceRenderer::draw_mouth(int cx, int cy, const expression_params_t& p) {
-    // Mouth centered below eyes
-    int mx = cx;
-    int my = cy + 25;
+    float open = p.mouth_open;
+    float curve = p.mouth_curve;  // 0=frown, 0.5=neutral, 1=smile
 
-    // mouth_open: 0.0=closed, 1.0=wide open
-    // mouth_curve: 0.0=frown, 0.5=neutral, 1.0=smile
-    float openness = p.mouth_open;
-    float curve = p.mouth_curve; // 0..1, 0.5 is neutral
+    // Mouth shape
+    int mw = 15 + (int)(open * 5);
+    int mh = 2 + (int)(open * 8);
 
-    int mw = 44;
-    int mh = static_cast<int>(8 + 24 * openness); // grows with openness
-    if (mh < 2) mh = 2;
+    // Smile curve offset
+    int curve_offset = (int)((curve - 0.5f) * 6);
 
-    // Map curve to ± amplitude: 0→frown, 0.5→flat, 1→smile
-    float curve_amp = (curve - 0.5f) * 2.0f * 8.0f; // ±8 pixels
-
-    if (openness > 0.3f) {
-        // Open mouth — draw as ellipse
-        m_lcd.fillEllipse(mx, my, mw / 2, mh / 2, TFT_WHITE);
-        m_lcd.drawEllipse(mx, my, mw / 2, mh / 2, TFT_WHITE);
-
-        // Inner mouth (dark)
-        if (openness > 0.4f) {
-            int inner_h = static_cast<int>(mh * 0.45f);
-            m_lcd.fillEllipse(mx, my + 1, mw / 2 - 3, inner_h / 2, rgb565(80, 20, 20));
+    for (int y = 0; y < mh; y++) {
+        for (int x = -mw; x <= mw; x++) {
+            // Parabolic mouth shape
+            float nx = x / (float)mw;
+            float ny = y / (float)mh - 0.5f + curve_offset * 0.05f;
+            if (ny * ny + nx * nx * 0.5f <= 0.5f) {
+                draw_pixel(cx + x, cy + y, (y < mh / 2) ? 0x7800 : 0xF800);
+            }
         }
-
-        // Slight curve at corners
-        int corner_y = my + static_cast<int>(curve_amp * 0.3f);
-        m_lcd.fillCircle(mx - mw / 2, corner_y, 2, TFT_WHITE);
-        m_lcd.fillCircle(mx + mw / 2, corner_y, 2, TFT_WHITE);
-    } else {
-        // Closed or slightly open mouth — draw as an arc
-        int segments = 16;
-        int prev_x = mx - mw / 2;
-        int prev_y = my + static_cast<int>(curve_amp * 0.3f);
-
-        for (int i = 1; i <= segments; i++) {
-            float t = static_cast<float>(i) / static_cast<float>(segments);
-            float angle = t * 3.14159f; // 0 to PI
-            float x_offset = (mw / 2) * cos(angle - 3.14159f / 2);
-            // Arc shape: curve_amp at center, flat at edges
-            float y_offset = curve_amp * sin(angle);
-
-            int sx = mx + static_cast<int>(x_offset);
-            int sy = my + static_cast<int>(y_offset);
-
-            m_lcd.drawLine(prev_x, prev_y, sx, sy, TFT_WHITE);
-            prev_x = sx;
-            prev_y = sy;
-        }
-
-        // Horizontal base line for more definition
-        m_lcd.drawLine(mx - mw / 2, my, mx + mw / 2, my, TFT_WHITE);
-
-        // Corners
-        int corner_y = my + static_cast<int>(curve_amp * 0.3f);
-        m_lcd.fillCircle(mx - mw / 2, corner_y, 2, TFT_WHITE);
-        m_lcd.fillCircle(mx + mw / 2, corner_y, 2, TFT_WHITE);
     }
 }
 
 void FaceRenderer::draw_blush(int cx, int cy, const expression_params_t& p) {
-    // blush: 0.0=none, 1.0=full blush
-    if (p.blush < 0.01f) return;
+    if (p.blush < 0.05f) return;
 
-    int intensity = static_cast<int>(p.blush * 40);
-    uint16_t blush_color = rgb565(
-        255,
-        180 - intensity,
-        180 - intensity
-    );
+    int br = 8 + (int)(p.blush * 4);
+    uint16_t blush_color = 0xFD20;  // Pink
 
-    // Blush circles below and to the sides of each eye
-    int left_bx = cx - 44;
-    int right_bx = cx + 44;
-    int by = cy + 2;
-    int br = 14 + static_cast<int>(p.blush * 6);
-
-    m_lcd.fillEllipse(left_bx, by, br, br / 2, blush_color);
-    m_lcd.fillEllipse(right_bx, by, br, br / 2, blush_color);
-}
-
-void FaceRenderer::draw_tears(int cx, int cy, const expression_params_t& p) {
-    // tears: 0.0=none, 1.0=full tears
-    if (p.tears < 0.01f) return;
-
-    // Number of tear drops scales with intensity
-    int tear_count = static_cast<int>(p.tears * 5);
-    if (tear_count < 1) tear_count = 1;
-
-    uint16_t tear_color = rgb565(150, 180, 255);
-
-    int eye_spacing = 60;
-    int base_y = cy - 15;
-
-    for (int i = 0; i < tear_count && i < 6; i++) {
-        int tx_left = cx - eye_spacing - 3 + (i * 2);
-        int tx_right = cx + eye_spacing - 3 + (i * 2);
-        int ty = base_y + 18 + (i * 8);
-
-        // Small teardrop shapes
-        m_lcd.fillCircle(tx_left, ty, 2, tear_color);
-        m_lcd.fillCircle(tx_right, ty, 2, tear_color);
-
-        // Tear streak
-        if (i > 0) {
-            m_lcd.drawLine(tx_left, ty - 3, tx_left, ty + 1, tear_color);
-            m_lcd.drawLine(tx_right, ty - 3, tx_right, ty + 1, tear_color);
+    for (int y = -br; y <= br; y++) {
+        for (int x = -br; x <= br; x++) {
+            float d = (x * x + y * y) / (float)(br * br);
+            if (d <= 1.0f) {
+                uint8_t alpha = (uint8_t)((1.0f - d) * p.blush * 80);
+                if (alpha > 10) {
+                    draw_pixel(cx + x, cy + y, blush_color);
+                }
+            }
         }
     }
 }
 
-// ============================================================
-// Color helpers
-// ============================================================
+void FaceRenderer::draw_tears(int cx, int cy, const expression_params_t& p) {
+    if (p.tears < 0.05f) return;
 
-uint16_t FaceRenderer::rgb565(uint8_t r, uint8_t g, uint8_t b) const {
-    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    int intensity = (int)(p.tears * 4);
+    uint16_t tear_color = 0x7BEF;  // Light blue-gray
+
+    for (int t = 0; t < intensity; t++) {
+        int tx = cx + (t - intensity / 2) * 3;
+        int ty = cy + 10 + t * 6;
+        for (int y = -2; y <= 3; y++) {
+            for (int x = -1; x <= 1; x++) {
+                draw_pixel(tx + x, ty + y, tear_color);
+            }
+        }
+    }
 }
 
-uint16_t FaceRenderer::lerp_color(uint16_t c1, uint16_t c2, float t) const {
-    // Extract R,G,B from 565 format
-    uint8_t r1 = (c1 >> 11) & 0x1F;
-    uint8_t g1 = (c1 >> 5) & 0x3F;
-    uint8_t b1 = c1 & 0x1F;
+void FaceRenderer::draw_heart_eyes(int cx, int cy, const expression_params_t& p, bool is_left) {
+    (void)p;
+    uint16_t heart_color = 0xF800;  // Red
 
-    uint8_t r2 = (c2 >> 11) & 0x1F;
-    uint8_t g2 = (c2 >> 5) & 0x3F;
-    uint8_t b2 = c2 & 0x1F;
-
-    uint8_t r = static_cast<uint8_t>(r1 + (r2 - r1) * t);
-    uint8_t g = static_cast<uint8_t>(g1 + (g2 - g1) * t);
-    uint8_t b = static_cast<uint8_t>(b1 + (b2 - b1) * t);
-
-    return (r << 11) | (g << 5) | b;
+    // Simple heart shape
+    int r = 7;
+    for (int y = -r; y <= r; y++) {
+        for (int x = -r; x <= r; x++) {
+            float dx = x / (float)r;
+            float dy = y / (float)r;
+            // Heart equation
+            float val = (dx * dx + dy * dy - 1);
+            float heart = val * val * val - dx * dx * dy * dy * dy;
+            if (heart < 0) {
+                draw_pixel(cx + x, cy + y, heart_color);
+            }
+        }
+    }
 }
