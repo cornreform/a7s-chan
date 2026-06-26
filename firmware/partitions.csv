@@ -1,0 +1,10 @@
+# ESP-IDF Partition Table for M5Stack CoreS3
+# 16MB Flash, 3MB factory + 3MB OTA (x2), 896KB NVS, 5.1MB spiffs
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x300000,
+ota_0,    app,  ota_0,   0x310000,0x300000,
+ota_1,    app,  ota_1,   0x610000,0x300000,
+nvs_data, data, nvs,     0x910000,0x4000,
+storage,  data, spiffs,  0x914000,0x51C000,

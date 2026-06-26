@@ -1,0 +1,47 @@
+# A7S-chan Configuration
+
+wifi:
+  ssid: "A7S-AP"           # A7S WiFi hotspot name
+  password: "changeme123"  # Hotspot password
+  channel: 6               # 2.4GHz channel
+
+stackchan:
+  ip: "192.168.1.100"      # Stack-chan ESP32 IP address (static DHCP)
+  cmd_port: 9002
+  status_port: 9000
+  mic_port: 9001
+
+vision:
+  enabled: true
+  npu_bin: ~/ai-sdk/examples/vpm_run/vpm_run
+  model: ~/ai-sdk/examples/yolov5/model/v3/yolov5.nb
+  input_path: /tmp/npu_frame.dat
+
+voice:
+  xai_api_key: ""           # Set via env var XAI_API_KEY or here
+  openai_api_key: ""        # Set via env var OPENAI_API_KEY or here
+  provider: "xai"           # xai or openai
+  language: "zh"            # Language hint for STT
+
+agent:
+  provider: "deepseek"
+  api_key: ""               # Set via env var or here
+  model: "deepseek-v4-flash"
+  base_url: "https://api.deepseek.com/v1"
+
+behavior:
+  idle_timeout_s: 30        # idle → sleep after 30s
+  sleep_timeout_s: 300      # deep sleep after 5min
+  auto_scan_interval: 3     # look around every 3s
+  conversation_timeout: 15  # end conversation after 15s silence
+
+weather:
+  api_key: ""               # OpenWeatherMap API key
+  default_city: "Hong Kong"
+
+ir:
+  # IR codes — see tools/ir_remote.py for database
+  device_list: ["aircon", "tv", "light"]
+
+logging:
+  level: "INFO"             # DEBUG, INFO, WARNING, ERROR
