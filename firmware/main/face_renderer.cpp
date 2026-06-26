@@ -150,7 +150,8 @@ void FaceRenderer::draw_mouth_line(int fy, int cx, int cy, const expression_para
 }
 
 void FaceRenderer::draw_blush_line(int fy, int cx, int cy, const expression_params_t& p) {
-    if(p.blush<0.05f) return; int br=8+(int)(p.blush*4), ry=fy-cy;
+    if(p.blush<0.05f) return;
+    int br=8+(int)(p.blush*4), ry=fy-cy;
     if(abs(ry)>br) return;
     for(int x=-br;x<=br;x++) { int px=m_cx+cx+x; if(px<0||px>=LCD_WIDTH) continue;
         float d=(x*x+ry*ry)/(float)(br*br);
@@ -159,7 +160,8 @@ void FaceRenderer::draw_blush_line(int fy, int cx, int cy, const expression_para
 }
 
 void FaceRenderer::draw_tears_line(int fy, int cx, int cy, const expression_params_t& p) {
-    if(p.tears<0.05f) return; int n=(int)(p.tears*4);
+    if(p.tears<0.05f) return;
+    int n=(int)(p.tears*4);
     for(int t=0;t<n;t++) { int ty=cy+10+t*6; if(abs(fy-ty)>3) continue;
         int tx=cx+(t-n/2)*3;
         for(int x=-1;x<=1;x++) { int px=m_cx+tx+x; if(px<0||px>=LCD_WIDTH) continue;
