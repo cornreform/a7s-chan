@@ -83,16 +83,21 @@ void FaceRenderer::lcd_init() {
 }
 
 void FaceRenderer::lcd_write_cmd(uint8_t cmd) {
-    // Force GPIO35 back to GPIO output (SPI may have overridden it as MISO)
     gpio_set_direction(CORE3_LCD_DC, GPIO_MODE_OUTPUT);
-    gpio_set_level(CORE3_LCD_DC, 0);  // Command mode
-    spi_device_polling_transmit(m_spi, &(spi_transaction_t){ .length = 8, .tx_buffer = &cmd });
+    gpio_set_level(CORE3_LCD_DC, 0);
+    spi_transaction_t t = {};
+    t.length = 8;
+    t.tx_buffer = &cmd;
+    spi_device_polling_transmit(m_spi, &t);
 }
 
 void FaceRenderer::lcd_write_data(const uint8_t* data, size_t len) {
     gpio_set_direction(CORE3_LCD_DC, GPIO_MODE_OUTPUT);
-    gpio_set_level(CORE3_LCD_DC, 1);  // Data mode
-    spi_device_polling_transmit(m_spi, &(spi_transaction_t){ .length = len * 8, .tx_buffer = data });
+    gpio_set_level(CORE3_LCD_DC, 1);
+    spi_transaction_t t = {};
+    t.length = len * 8;
+    t.tx_buffer = data;
+    spi_device_polling_transmit(m_spi, &t);
 }
 
 void FaceRenderer::lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
@@ -107,10 +112,10 @@ void FaceRenderer::send_line(int y) {
     lcd_set_window(0, y, LCD_WIDTH - 1, y);
     gpio_set_direction(CORE3_LCD_DC, GPIO_MODE_OUTPUT);
     gpio_set_level(CORE3_LCD_DC, 1);
-    spi_device_polling_transmit(m_spi, &(spi_transaction_t){
-        .length = LCD_WIDTH * 16,
-        .tx_buffer = m_line_buf,
-    });
+    spi_transaction_t t = {};
+    t.length = LCD_WIDTH * 16;
+    t.tx_buffer = m_line_buf;
+    spi_device_polling_transmit(m_spi, &t);
 }
 
 // ── Public API ────────────────────────────────────────────────
@@ -203,8 +208,6 @@ void FaceRenderer::render() {
             // Eyes
             draw_eye_line(fy, eye_cx_left, eye_cy, m_current_params, true);
             draw_eye_line(fy, eye_cx_right, eye_cy, m_current_params, false);
-
-            // Eyebrows
             draw_eyebrow_line(fy, eye_cx_left, eye_cy - 20, m_current_params, true);
             draw_eyebrow_line(fy, eye_cx_right, eye_cy - 20, m_current_params, false);
 
@@ -253,7 +256,6 @@ static bool is_in_ellipse(int x, int y, int cx, int cy, int rx, int ry) {
     return (dx * dx + dy * dy) <= 1.0f;
 }
 
-static bool is_point_in_rect(int px, int py, int rx, int ry, int w, int h) {
     return px >= rx && px < rx + w && py >= ry && py < ry + h;
 }
 
@@ -281,7 +283,6 @@ void FaceRenderer::draw_eye_line(int line_y, int cx, int cy, const expression_pa
     if (abs(fy) > eye_h) return;
 
     // Draw white of eye for this line
-    int y_in_eye = fy + eye_h;
     for (int x = -eye_w; x <= eye_w; x++) {
         if (cx + x < 0 || cx + x >= LCD_WIDTH) continue;
         if (is_in_ellipse(cx + x, cy + fy, cx, cy, eye_w, eye_h)) {
