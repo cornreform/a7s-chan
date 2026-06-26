@@ -50,8 +50,8 @@ void FaceRenderer::lcd_init() {
 
     // Attach LCD device
     spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.mode = 0;
-    dev_cfg.clock_speed_hz = 40 * 1000 * 1000;
+    dev_cfg.mode = 0;  // SPI mode 0 for ILI9342C
+    dev_cfg.clock_speed_hz = 26 * 1000 * 1000;  // 26MHz
     dev_cfg.spics_io_num = CORE3_LCD_CS;
     dev_cfg.queue_size = 1;
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev_cfg, &m_spi));
