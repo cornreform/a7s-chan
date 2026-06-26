@@ -31,6 +31,11 @@ FaceRenderer::~FaceRenderer() {
 // ── LCD Low-Level ────────────────────────────────────────────
 
 void FaceRenderer::lcd_init() {
+    // Enable peripheral power (CoreS3 PMIC control)
+    gpio_set_direction(GPIO_NUM_3, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_3, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     // Initialize SPI bus (only if not already initialized)
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = CORE3_LCD_MOSI;
