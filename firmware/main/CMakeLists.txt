@@ -24,4 +24,5 @@ idf_component_register(
         newlib
         esp_lcd
         esp_mm
+        m5stack_core_s3
 )
