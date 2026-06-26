@@ -457,13 +457,12 @@ static void wifi_init_sta(void) {
                                                         NULL,
                                                         &instance_got_ip));
 
-    // WiFi SSID and password from sdkconfig
-    // These must be provided via sdkconfig or menuconfig
+    // WiFi credentials
     #ifndef CONFIG_ESP_WIFI_SSID
-    #define CONFIG_ESP_WIFI_SSID "StackChan"
+    #define CONFIG_ESP_WIFI_SSID "SC"
     #endif
     #ifndef CONFIG_ESP_WIFI_PASSWORD
-    #define CONFIG_ESP_WIFI_PASSWORD ""
+    #define CONFIG_ESP_WIFI_PASSWORD "8447Ce8086"
     #endif
 
     wifi_config_t wifi_config = {};
