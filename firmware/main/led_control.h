@@ -9,7 +9,7 @@
 
 // LED strip configuration
 #define LED_COUNT          12
-#define LED_GPIO           38  // CoreS3 RGB LED data pin
+#define LED_GPIO           45  // CoreS3 RGB LED data pin (NOT GPIO 38 - that's LCD backlight!)
 #define LED_SPI_HOST       SPI2_HOST
 #define LED_SPI_CLK_SPEED  4000000  // 4MHz SPI for WS2812 timing
 

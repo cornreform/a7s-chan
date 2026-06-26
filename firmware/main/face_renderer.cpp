@@ -18,13 +18,20 @@ FaceRenderer::FaceRenderer()
 bool FaceRenderer::begin() {
     const bsp_display_config_t cfg = { .max_transfer_sz = LCD_WIDTH * 80 * 2 };
     esp_lcd_panel_io_handle_t io = NULL;
-    ESP_ERROR_CHECK(bsp_display_new(&cfg, &m_panel, &io));
+    esp_err_t err = bsp_display_new(&cfg, &m_panel, &io);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "bsp_display_new failed: %d", err); return false; }
     bsp_display_backlight_on();
-    esp_lcd_panel_disp_on_off(m_panel, true);  // Enable display output
+    err = esp_lcd_panel_disp_on_off(m_panel, true);
+    if (err != ESP_OK) ESP_LOGE(TAG, "disp_on_off failed: %d", err);
     ESP_LOGI(TAG, "Display ready via BSP");
-    // Flash test
-    uint16_t c = 0xF800;
-    esp_lcd_panel_draw_bitmap(m_panel, 0, 0, 1, 1, &c);
+    // Fill screen RED using line buffer
+    for (int i = 0; i < LCD_WIDTH; i++) m_line_buf[i] = 0xF800;
+    for (int y = 0; y < LCD_HEIGHT; y++) {
+        err = esp_lcd_panel_draw_bitmap(m_panel, 0, y, LCD_WIDTH, y+1, m_line_buf);
+        if (err != ESP_OK) { ESP_LOGE(TAG, "red line %d failed: %d", y, err); break; }
+    }
+    if (err == ESP_OK) ESP_LOGI(TAG, "RED fill OK");
+    vTaskDelay(pdMS_TO_TICKS(1000));
     set_expression(EXPR_IDLE);
     return true;
 }
