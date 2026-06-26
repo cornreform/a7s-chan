@@ -137,12 +137,13 @@ extern "C" void app_main(void) {
     }
 
     // Connect to WiFi
+    ESP_LOGI(TAG, "Connecting to WiFi...");
     wifi_init_sta();
 
-    // Wait for WiFi connection
+    // Wait briefly for WiFi connection (non-blocking)
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE, pdFALSE, portMAX_DELAY);
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));  // 5s timeout
 
     if (bits & WIFI_CONNECTED_BIT) {
         s_wifi_connected = true;
