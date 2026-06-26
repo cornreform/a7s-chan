@@ -27,9 +27,9 @@
 
 static const char* TAG = "StackChan";
 
-// WiFi configuration (can be overridden via sdkconfig)
-#define WIFI_SSID           CONFIG_ESP_WIFI_SSID
-#define WIFI_PASS           CONFIG_ESP_WIFI_PASSWORD
+// WiFi configuration (hardcoded)
+#define WIFI_SSID           "SC"
+#define WIFI_PASS           "8447Ce8086"
 #define WIFI_MAX_RETRY      5
 
 // Free heap threshold warning
