@@ -119,11 +119,22 @@ void FaceRenderer::lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_
 void FaceRenderer::lcd_flush() {
     lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
     gpio_set_level(CORE3_LCD_DC, 1);
-    spi_transaction_t t = {
-        .length = LCD_WIDTH * LCD_HEIGHT * 16,
-        .tx_buffer = m_fb,
-    };
-    spi_device_transmit(m_spi, &t);
+
+    // Send framebuffer in chunks of 4096 bytes (ESP32-S3 SPI limit)
+    const size_t chunk_size = 4096;
+    uint8_t* data = (uint8_t*)m_fb;
+    size_t remaining = LCD_WIDTH * LCD_HEIGHT * 2;
+
+    while (remaining > 0) {
+        size_t to_send = (remaining > chunk_size) ? chunk_size : remaining;
+        spi_transaction_t t = {
+            .length = to_send * 8,
+            .tx_buffer = data,
+        };
+        spi_device_transmit(m_spi, &t);
+        data += to_send;
+        remaining -= to_send;
+    }
 }
 
 void FaceRenderer::draw_pixel(uint16_t x, uint16_t y, uint16_t color) {
