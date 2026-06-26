@@ -1,231 +1,346 @@
 #include "audio_pipeline.h"
+#include <cstring>
+#include <cmath>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
-#include <cstring>
+#include "freertos/queue.h"
 
-static const char* TAG = "audio";
+static const char* TAG = "AudioPipeline";
 
-int audio_init(audio_pipeline_t* audio,
-               int mic_bck_pin, int mic_ws_pin, int mic_data_pin,
-               int spkr_bck_pin, int spkr_ws_pin, int spkr_data_pin,
-               int amp_enable_pin) {
-    
-    memset(audio, 0, sizeof(audio_pipeline_t));
-    
-    audio->mic_bck_pin = mic_bck_pin;
-    audio->mic_ws_pin = mic_ws_pin;
-    audio->mic_data_pin = mic_data_pin;
-    audio->spkr_bck_pin = spkr_bck_pin;
-    audio->spkr_ws_pin = spkr_ws_pin;
-    audio->spkr_data_pin = spkr_data_pin;
-    audio->amp_enable_pin = amp_enable_pin;
+// Ring buffer size for mic data (200ms)
+#define MIC_RING_BUFFER_MS   200
+#define MIC_RING_SAMPLES     (AUDIO_SAMPLE_RATE * MIC_RING_BUFFER_MS / 1000)
 
-    esp_err_t err;
-
-    // ---- Microphone (RX) ----
-    if (mic_bck_pin >= 0 && mic_data_pin >= 0) {
-        i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-        rx_chan_cfg.auto_clear = true;
-        
-        err = i2s_new_channel(&rx_chan_cfg, NULL, &audio->rx_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "i2s_new_channel RX failed: %s", esp_err_to_name(err));
-            audio->rx_handle = NULL;
-        } else {
-            // Standard I2S RX config
-            i2s_std_config_t rx_std_cfg = {
-                .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-                .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
-                    I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-                .gpio_cfg = {
-                    .mclk = I2S_GPIO_UNUSED,
-                    .bclk = (gpio_num_t)mic_bck_pin,
-                    .ws = (gpio_num_t)(mic_ws_pin >= 0 ? mic_ws_pin : mic_bck_pin + 1),
-                    .dout = I2S_GPIO_UNUSED,
-                    .din = (gpio_num_t)mic_data_pin,
-                    .invert_flags = {
-                        .mclk_inv = false,
-                        .bclk_inv = false,
-                        .ws_inv = false
-                    }
-                }
-            };
-
-            // If ws pin is explicitly provided, use it
-            if (mic_ws_pin >= 0) {
-                rx_std_cfg.gpio_cfg.ws = (gpio_num_t)mic_ws_pin;
-            }
-
-            err = i2s_channel_init_std_mode(audio->rx_handle, &rx_std_cfg);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "i2s_channel_init_std_mode RX failed: %s", esp_err_to_name(err));
-                i2s_del_channel(audio->rx_handle);
-                audio->rx_handle = NULL;
-            } else {
-                audio->mic_enabled = true;
-                ESP_LOGI(TAG, "I2S mic initialized (BCK:%d, WS:%d, DATA:%d)",
-                         mic_bck_pin, mic_ws_pin, mic_data_pin);
-            }
-        }
-    }
-
-    // ---- Speaker (TX) ----
-    if (spkr_bck_pin >= 0 && spkr_data_pin >= 0) {
-        i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-        tx_chan_cfg.auto_clear = true;
-        
-        err = i2s_new_channel(&tx_chan_cfg, &audio->tx_handle, NULL);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "i2s_new_channel TX failed: %s", esp_err_to_name(err));
-            audio->tx_handle = NULL;
-        } else {
-            i2s_std_config_t tx_std_cfg = {
-                .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-                .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
-                    I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-                .gpio_cfg = {
-                    .mclk = I2S_GPIO_UNUSED,
-                    .bclk = (gpio_num_t)spkr_bck_pin,
-                    .ws = (gpio_num_t)(spkr_ws_pin >= 0 ? spkr_ws_pin : spkr_bck_pin + 1),
-                    .dout = (gpio_num_t)spkr_data_pin,
-                    .din = I2S_GPIO_UNUSED,
-                    .invert_flags = {
-                        .mclk_inv = false,
-                        .bclk_inv = false,
-                        .ws_inv = false
-                    }
-                }
-            };
-
-            if (spkr_ws_pin >= 0) {
-                tx_std_cfg.gpio_cfg.ws = (gpio_num_t)spkr_ws_pin;
-            }
-
-            err = i2s_channel_init_std_mode(audio->tx_handle, &tx_std_cfg);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "i2s_channel_init_std_mode TX failed: %s", esp_err_to_name(err));
-                i2s_del_channel(audio->tx_handle);
-                audio->tx_handle = NULL;
-            } else {
-                audio->spkr_enabled = true;
-                ESP_LOGI(TAG, "I2S speaker initialized (BCK:%d, WS:%d, DATA:%d)",
-                         spkr_bck_pin, spkr_ws_pin, spkr_data_pin);
-            }
-        }
-    }
-
-    // Amplifier enable pin
-    if (amp_enable_pin >= 0) {
-        audio->amp_enable_pin = amp_enable_pin;
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << amp_enable_pin),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_ENABLE,
-            .intr_type = GPIO_INTR_DISABLE
-        };
-        gpio_config(&io_conf);
-        gpio_set_level((gpio_num_t)amp_enable_pin, 0);  // Off by default
-    }
-
-    audio->initialized = true;
-    ESP_LOGI(TAG, "Audio pipeline initialized");
-    return 0;
+AudioPipeline::AudioPipeline()
+    : m_mic_handle(nullptr)
+    , m_spk_handle(nullptr)
+    , m_mic_started(false)
+    , m_spk_started(false)
+    , m_playing(false)
+    , m_volume(0.5f)
+    , m_mic_callback(nullptr)
+    , m_mic_callback_arg(nullptr)
+    , m_mic_buffer(nullptr)
+    , m_mic_buffer_head(0)
+    , m_mic_buffer_tail(0)
+    , m_mic_buffer_size_samples(MIC_RING_SAMPLES)
+    , m_play_task_handle(nullptr)
+{
 }
 
-int audio_read(audio_pipeline_t* audio, int16_t* buffer, size_t num_samples, uint32_t timeout_ms) {
-    if (!audio->initialized || !audio->mic_enabled || !audio->rx_handle) {
-        return -1;
+AudioPipeline::~AudioPipeline() {
+    stop_mic();
+    stop_speaker();
+
+    if (m_mic_buffer) {
+        heap_caps_free(m_mic_buffer);
+        m_mic_buffer = nullptr;
     }
 
-    size_t bytes_read = 0;
-    size_t bytes_to_read = num_samples * sizeof(int16_t);
-    
-    esp_err_t err = i2s_channel_read(audio->rx_handle, buffer, bytes_to_read, 
-                                      &bytes_read, pdMS_TO_TICKS(timeout_ms));
+    if (m_mic_handle) {
+        i2s_del_channel(m_mic_handle);
+    }
+
+    if (m_spk_handle) {
+        i2s_del_channel(m_spk_handle);
+    }
+}
+
+bool AudioPipeline::begin() {
+    // Allocate mic ring buffer
+    m_mic_buffer = (int16_t*)heap_caps_malloc(
+        m_mic_buffer_size_samples * sizeof(int16_t),
+        MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL
+    );
+
+    if (!m_mic_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate mic buffer");
+        return false;
+    }
+
+    memset(m_mic_buffer, 0, m_mic_buffer_size_samples * sizeof(int16_t));
+
+    bool mic_ok = init_mic();
+    bool spk_ok = init_speaker();
+
+    ESP_LOGI(TAG, "Audio pipeline init - Mic: %s, Speaker: %s",
+             mic_ok ? "OK" : "FAIL",
+             spk_ok ? "OK" : "FAIL");
+
+    return mic_ok || spk_ok;
+}
+
+bool AudioPipeline::init_mic() {
+    // I2S config for microphone (PDM input)
+    i2s_chan_config_t chan_config = {
+        .id = I2S_MIC_PORT,
+        .role = I2S_ROLE_MASTER,
+        .dma_desc_num = 6,
+        .dma_frame_num = AUDIO_BUFFER_SAMPLES,
+        .auto_clear = true,
+    };
+
+    esp_err_t err = i2s_new_channel(&chan_config, NULL, &m_mic_handle);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
-        return -1;
+        ESP_LOGE(TAG, "Failed to create mic channel: %d", err);
+        return false;
+    }
+
+    // PDM RX (microphone) standard config
+    i2s_std_config_t std_config = {
+        .clk_cfg = {
+            .sample_rate_hz = AUDIO_SAMPLE_RATE,
+            .clk_src = I2S_CLK_SRC_DEFAULT,
+            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+        },
+        .slot_cfg = {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+            .slot_mode = I2S_SLOT_MODE_MONO,
+            .slot_mask = I2S_STD_SLOT_LEFT,
+            .ws_width = I2S_SLOT_BIT_WIDTH_16BIT,
+            .ws_pol = false,
+            .bit_shift = true,
+            .msb_right = true,
+        },
+        .gpio_cfg = {
+            .bclk = (gpio_num_t)I2S_MIC_BCLK,
+            .ws = (gpio_num_t)I2S_MIC_WS,
+            .dout = I2S_GPIO_UNUSED,
+            .din = (gpio_num_t)I2S_MIC_DIN,
+            .invert_flags = {
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    // For PDM mic, use PDM RX config instead
+    i2s_pdm_rx_config_t pdm_rx_config = {
+        .clk_cfg = {
+            .sample_rate_hz = AUDIO_SAMPLE_RATE,
+            .clk_src = I2S_CLK_SRC_DEFAULT,
+        },
+        .slot_cfg = {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+            .slot_mode = I2S_SLOT_MODE_MONO,
+            .slot_mask = I2S_PDM_SLOT_LEFT,
+        },
+        .gpio_cfg = {
+            .clk = (gpio_num_t)I2S_MIC_BCLK,
+            .din = (gpio_num_t)I2S_MIC_DIN,
+            .invert_flags = {
+                .clk_inv = false,
+            },
+        },
+    };
+
+    // Try PDM first, fall back to standard I2S
+    err = i2s_channel_init_pdm_rx_mode(m_mic_handle, &pdm_rx_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "PDM RX init failed, trying standard I2S: %d", err);
+        err = i2s_channel_init_std_mode(m_mic_handle, &std_config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Standard I2S init failed: %d", err);
+            i2s_del_channel(m_mic_handle);
+            m_mic_handle = nullptr;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool AudioPipeline::init_speaker() {
+    // I2S config for speaker output (I2S DAC, NS4168 amplifier)
+    i2s_chan_config_t chan_config = {
+        .id = I2S_SPK_PORT,
+        .role = I2S_ROLE_MASTER,
+        .dma_desc_num = 6,
+        .dma_frame_num = AUDIO_BUFFER_SAMPLES,
+        .auto_clear = true,
+    };
+
+    esp_err_t err = i2s_new_channel(&chan_config, &m_spk_handle, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create speaker channel: %d", err);
+        return false;
+    }
+
+    i2s_std_config_t std_config = {
+        .clk_cfg = {
+            .sample_rate_hz = AUDIO_SAMPLE_RATE,
+            .clk_src = I2S_CLK_SRC_DEFAULT,
+            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+        },
+        .slot_cfg = {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+            .slot_mode = I2S_SLOT_MODE_MONO,
+            .slot_mask = I2S_STD_SLOT_LEFT,
+            .ws_width = I2S_SLOT_BIT_WIDTH_16BIT,
+            .ws_pol = false,
+            .bit_shift = true,
+            .msb_right = true,
+        },
+        .gpio_cfg = {
+            .bclk = (gpio_num_t)I2S_SPK_BCLK,
+            .ws = (gpio_num_t)I2S_SPK_WS,
+            .dout = (gpio_num_t)I2S_SPK_DOUT,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    err = i2s_channel_init_std_mode(m_spk_handle, &std_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Speaker I2S init failed: %d", err);
+        i2s_del_channel(m_spk_handle);
+        m_spk_handle = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+bool AudioPipeline::start_mic() {
+    if (m_mic_started || !m_mic_handle) return false;
+
+    esp_err_t err = i2s_channel_enable(m_mic_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable mic: %d", err);
+        return false;
+    }
+
+    m_mic_started = true;
+    ESP_LOGI(TAG, "Microphone started");
+    return true;
+}
+
+void AudioPipeline::stop_mic() {
+    if (!m_mic_started || !m_mic_handle) return;
+
+    i2s_channel_disable(m_mic_handle);
+    m_mic_started = false;
+    ESP_LOGI(TAG, "Microphone stopped");
+}
+
+bool AudioPipeline::start_speaker() {
+    if (m_spk_started || !m_spk_handle) return false;
+
+    esp_err_t err = i2s_channel_enable(m_spk_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable speaker: %d", err);
+        return false;
+    }
+
+    m_spk_started = true;
+    ESP_LOGI(TAG, "Speaker started");
+    return true;
+}
+
+void AudioPipeline::stop_speaker() {
+    if (!m_spk_started || !m_spk_handle) return;
+
+    i2s_channel_disable(m_spk_handle);
+    m_spk_started = false;
+    m_playing = false;
+    ESP_LOGI(TAG, "Speaker stopped");
+}
+
+void AudioPipeline::play(const int16_t* data, size_t samples) {
+    if (!m_spk_started || !m_spk_handle || !data || samples == 0) return;
+
+    m_playing = true;
+
+    // Apply volume
+    size_t bytes_to_write = samples * sizeof(int16_t);
+    int16_t* vol_buffer = nullptr;
+
+    if (m_volume < 0.99f) {
+        vol_buffer = (int16_t*)heap_caps_malloc(bytes_to_write, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (vol_buffer) {
+            for (size_t i = 0; i < samples; i++) {
+                vol_buffer[i] = static_cast<int16_t>(data[i] * m_volume);
+            }
+        }
+    }
+
+    size_t bytes_written = 0;
+    const int16_t* source = vol_buffer ? vol_buffer : data;
+
+    i2s_channel_write(m_spk_handle, source, bytes_to_write, &bytes_written, portMAX_DELAY);
+
+    if (vol_buffer) {
+        heap_caps_free(vol_buffer);
+    }
+
+    m_playing = false;
+}
+
+void AudioPipeline::play_async(const int16_t* data, size_t samples) {
+    // For now, just play synchronously
+    play(data, samples);
+}
+
+bool AudioPipeline::is_playing() const {
+    return m_playing;
+}
+
+void AudioPipeline::set_mic_callback(audio_data_callback_t callback, void* user_arg) {
+    m_mic_callback = callback;
+    m_mic_callback_arg = user_arg;
+}
+
+void AudioPipeline::set_volume(float volume) {
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    m_volume = volume;
+}
+
+int AudioPipeline::read_mic_data(int16_t* buffer, size_t max_samples, int timeout_ms) {
+    if (!m_mic_started || !m_mic_handle || !buffer || max_samples == 0) return 0;
+
+    size_t bytes_read = 0;
+    size_t bytes_requested = max_samples * sizeof(int16_t);
+
+    esp_err_t err = i2s_channel_read(m_mic_handle, buffer, bytes_requested,
+                                      &bytes_read, pdMS_TO_TICKS(timeout_ms));
+
+    if (err != ESP_OK) {
+        return 0;
     }
 
     return bytes_read / sizeof(int16_t);
 }
 
-int audio_write(audio_pipeline_t* audio, const int16_t* buffer, size_t num_samples, uint32_t timeout_ms) {
-    if (!audio->initialized || !audio->spkr_enabled || !audio->tx_handle) {
-        return -1;
-    }
+int AudioPipeline::write_speaker(const int16_t* data, size_t samples, int timeout_ms) {
+    if (!m_spk_started || !m_spk_handle || !data || samples == 0) return 0;
 
+    m_playing = true;
+
+    // Apply volume
+    size_t bytes_to_write = samples * sizeof(int16_t);
     size_t bytes_written = 0;
-    size_t bytes_to_write = num_samples * sizeof(int16_t);
-    
-    esp_err_t err = i2s_channel_write(audio->tx_handle, buffer, bytes_to_write,
-                                       &bytes_written, pdMS_TO_TICKS(timeout_ms));
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "i2s_channel_write failed: %s", esp_err_to_name(err));
-        return -1;
+
+    if (m_volume < 0.99f) {
+        int16_t* vol_buffer = (int16_t*)heap_caps_malloc(bytes_to_write, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (vol_buffer) {
+            for (size_t i = 0; i < samples; i++) {
+                vol_buffer[i] = static_cast<int16_t>(data[i] * m_volume);
+            }
+            i2s_channel_write(m_spk_handle, vol_buffer, bytes_to_write, &bytes_written, pdMS_TO_TICKS(timeout_ms));
+            heap_caps_free(vol_buffer);
+        }
+    } else {
+        i2s_channel_write(m_spk_handle, data, bytes_to_write, &bytes_written, pdMS_TO_TICKS(timeout_ms));
     }
 
+    m_playing = false;
     return bytes_written / sizeof(int16_t);
-}
-
-void audio_mic_enable(audio_pipeline_t* audio, bool enable) {
-    if (!audio->initialized || !audio->rx_handle) return;
-    
-    if (enable && !audio->mic_enabled) {
-        i2s_channel_enable(audio->rx_handle);
-        audio->mic_enabled = true;
-    } else if (!enable && audio->mic_enabled) {
-        i2s_channel_disable(audio->rx_handle);
-        audio->mic_enabled = false;
-    }
-}
-
-void audio_spkr_enable(audio_pipeline_t* audio, bool enable) {
-    if (!audio->initialized) return;
-    
-    if (enable && !audio->spkr_enabled) {
-        if (audio->tx_handle) {
-            i2s_channel_enable(audio->tx_handle);
-        }
-        if (audio->amp_enable_pin >= 0) {
-            gpio_set_level((gpio_num_t)audio->amp_enable_pin, 1);
-        }
-        audio->spkr_enabled = true;
-    } else if (!enable && audio->spkr_enabled) {
-        if (audio->amp_enable_pin >= 0) {
-            gpio_set_level((gpio_num_t)audio->amp_enable_pin, 0);
-        }
-        if (audio->tx_handle) {
-            i2s_channel_disable(audio->tx_handle);
-        }
-        audio->spkr_enabled = false;
-    }
-}
-
-bool audio_is_mic_enabled(const audio_pipeline_t* audio) {
-    return audio->initialized && audio->mic_enabled;
-}
-
-bool audio_is_spkr_enabled(const audio_pipeline_t* audio) {
-    return audio->initialized && audio->spkr_enabled;
-}
-
-void audio_deinit(audio_pipeline_t* audio) {
-    if (audio->initialized) {
-        if (audio->rx_handle) {
-            i2s_channel_disable(audio->rx_handle);
-            i2s_del_channel(audio->rx_handle);
-        }
-        if (audio->tx_handle) {
-            i2s_channel_disable(audio->tx_handle);
-            i2s_del_channel(audio->tx_handle);
-        }
-        audio->mic_enabled = false;
-        audio->spkr_enabled = false;
-        audio->initialized = false;
-        ESP_LOGI(TAG, "Audio pipeline deinitialized");
-    }
 }

@@ -1,77 +1,86 @@
-#ifndef A7S_FACE_RENDERER_H
-#define A7S_FACE_RENDERER_H
+#pragma once
 
-#include <cstdint>
+#include <LovyanGFX.hpp>
 #include "expressions.h"
 
-// LovyanGFX includes - user must add component manually
-#include <LovyanGFX.hpp>
+// FaceRenderer - LovyanGFX-based expression rendering engine
+// Renders Stack-chan's face with 18 expressions and smooth tweening
+// Screen: 320x240 IPS display on M5Stack CoreS3
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+class FaceRenderer {
+public:
+    FaceRenderer();
+    ~FaceRenderer();
 
-// Face renderer configuration
-#define FACE_RENDER_INTERVAL_MS  10    // 100 fps update target
-#define AUTO_BLINK_INTERVAL_MS   3000  // Blink every ~3 seconds
-#define AUTO_BLINK_DURATION_MS   100   // Blink takes 100ms
-#define TWEEN_SPEED              0.15f // Interpolation speed per frame
+    // Initialize display hardware
+    bool begin();
 
-// Display dimensions (M5Stack CoreS3)
-#define DISPLAY_WIDTH  320
-#define DISPLAY_HEIGHT 240
+    // Set expression by ID (immediate)
+    void set_expression(expression_id_t expr_id);
 
-typedef struct {
-    // Current and target expressions
-    expression_t current_expr;
-    expression_t target_expr;
-    
-    // Auto-blink state
-    bool auto_blink;
-    uint32_t last_blink_ms;
-    bool blinking;
-    float blink_progress;
-    
-    // Tweening
-    bool tween_enabled;
-    float tween_speed;
-    
-    // Display handle
-    LGFX_Device* display;
-    
-    // Frame counter
-    uint32_t frame_count;
-    
-    bool initialized;
-} face_renderer_t;
+    // Set expression by name
+    bool set_expression_by_name(const char* name);
 
-// Initialize face renderer with LovyanGFX display
-// The display must already be initialized before calling this
-void face_renderer_init(face_renderer_t* renderer, LGFX_Device* display);
+    // Start smooth tween to target expression
+    void tween_to(expression_id_t target_id, uint32_t duration_ms);
 
-// Set target expression (will tween to it)
-void face_renderer_set_expression(face_renderer_t* renderer, const expression_t& expr);
+    // Get current expression ID
+    expression_id_t current_expression() const { return m_current_id; }
 
-// Set expression by preset name (immediately sets target)
-void face_renderer_set_preset(face_renderer_t* renderer, expression_name_t name);
+    // Get target expression ID (during tween)
+    expression_id_t target_expression() const { return m_target_id; }
 
-// Update and render one frame (call at ~100Hz)
-void face_renderer_update(face_renderer_t* renderer);
+    // Check if currently tweening
+    bool is_tweening() const { return m_tweening; }
 
-// Enable/disable auto-blink
-void face_renderer_set_auto_blink(face_renderer_t* renderer, bool enabled);
+    // Force re-render with current parameters
+    void render();
 
-// Force a blink now
-void face_renderer_force_blink(face_renderer_t* renderer);
+    // Update tween animation - call from main loop
+    void update(uint32_t now_ms);
 
-// Enable/disable tweening
-void face_renderer_set_tween(face_renderer_t* renderer, bool enabled);
+    // Set custom expression parameters directly
+    void set_custom_params(const expression_params_t& params);
 
-// Get the current rendered expression (after tweening)
-const expression_t& face_renderer_get_current(const face_renderer_t* renderer);
+    // Get screen dimensions
+    int width() const { return 320; }
+    int height() const { return 240; }
 
-#ifdef __cplusplus
-}
-#endif
+    // Screen center
+    int center_x() const { return 160; }
+    int center_y() const { return 120; }
 
-#endif // A7S_FACE_RENDERER_H
+    // Get the LGFX display object
+    LGFX_Device* display() { return &m_lcd; }
+
+    // Clear screen
+    void clear(uint16_t color = TFT_BLACK);
+
+private:
+    LGFX_Device m_lcd;
+
+    // Current and target expression
+    expression_id_t m_current_id;
+    expression_id_t m_target_id;
+    expression_params_t m_current_params;
+    expression_params_t m_target_params;
+
+    // Tween state
+    bool m_tweening;
+    uint32_t m_tween_start_ms;
+    uint32_t m_tween_duration_ms;
+
+    // Drawing helper functions
+    void draw_eye(int cx, int cy, const expression_params_t& p, bool is_left);
+    void draw_eyebrow(int cx, int cy, const expression_params_t& p, bool is_left);
+    void draw_mouth(int cx, int cy, const expression_params_t& p);
+    void draw_blush(int cx, int cy, const expression_params_t& p);
+    void draw_pupil(int cx, int cy, const expression_params_t& p, bool is_left);
+    void draw_tear(int cx, int cy, const expression_params_t& p);
+    void draw_sweatdrop(int cx, int cy, const expression_params_t& p);
+    void draw_sparkle(int cx, int cy, const expression_params_t& p);
+
+    // Color helpers
+    uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) const;
+    uint16_t lerp_color(uint16_t c1, uint16_t c2, float t) const;
+};

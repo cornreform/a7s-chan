@@ -1,153 +1,192 @@
-#ifndef A7S_UDP_CLIENT_H
-#define A7S_UDP_CLIENT_H
+#pragma once
 
 #include <cstdint>
-#include "expressions.h"
+#include <cstddef>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/queue.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "expressions.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// UDP protocol ports
+#define UDP_CMD_PORT        9002    // Incoming command port
+#define UDP_STATUS_PORT     9000    // Status telemetry out
+#define UDP_AUDIO_PORT      9001    // Audio streaming out
 
-// Network config
-#define UDP_PORT            5000
-#define UDP_RX_BUFFER_SIZE  2048
-#define UDP_TX_BUFFER_SIZE  2048
-#define WIFI_MAX_RETRIES    5
+// Maximum UDP packet sizes
+#define UDP_MAX_PACKET_SIZE   2048
+#define UDP_CMD_BUFFER_SIZE   4096
 
-// Command types (18 types total)
+// Status message interval (ms)
+#define STATUS_INTERVAL_MS   100
+
+// A7S host configuration
+#define A7S_HOST             "a7.local"   // mDNS hostname or IP
+#define A7S_STATUS_PORT      9000
+#define A7S_AUDIO_PORT       9001
+
+// Command types
 typedef enum {
     CMD_NONE = 0,
-    CMD_SET_EXPRESSION,       // Set face expression by preset name
-    CMD_SET_EXPRESSION_RAW,   // Set face expression by raw parameters
-    CMD_SET_SERVO,            // Set servo position
-    CMD_SET_SERVO_SMOOTH,     // Set servo position (smooth)
-    CMD_SEND_IR,              // Send IR NEC command
-    CMD_SET_LEDS,             // Set LED colors
-    CMD_SET_LED_PATTERN,      // Set LED pattern
-    CMD_PLAY_TONE,            // Play a tone on speaker
-    CMD_PLAY_AUDIO,           // Play audio data
-    CMD_SET_VOLUME,           // Set speaker volume
-    CMD_SET_BRIGHTNESS,       // Set display brightness
-    CMD_GET_STATUS,           // Request status report
-    CMD_REBOOT,               // Reboot the device
-    CMD_OTA_UPDATE,           // Start OTA update
-    CMD_SET_WIFI,             // Set WiFi credentials
-    CMD_CALIBRATE,            // Start calibration
-    CMD_PING,                 // Ping/pong keepalive
-    CMD_UNKNOWN
-} command_type_t;
+    CMD_HEAD,           // head: {"pan": 180, "tilt": 45, "speed": 1000}
+    CMD_FACE,           // face: {"expression": "happy", "tween_ms": 300}
+    CMD_LED,            // led: {"mode": "static", "r": 255, "g": 0, "b": 0, "leds": [0,1,2]}
+    CMD_IR,             // ir: {"address": 0, "command": 0x45, "repeat": 0}
+    CMD_SCREEN,         // screen: {"brightness": 200, "clear": true}
+    CMD_EMOTE,          // emote: {"expression": "wave", "repeat": 1}
+    CMD_SPEAK_START,    // speak_start: {"sample_rate": 16000}
+    CMD_SPEAK_DATA,     // speak_data: base64 audio data
+    CMD_SPEAK_STOP,     // speak_stop: {}
+    CMD_CUSTOM,         // custom params: all face params
+} cmd_type_t;
 
-// Command structure parsed from JSON
+// Parsed command structure
 typedef struct {
-    command_type_t type;
-    char cmd_name[32];
-    
-    // Expression
-    expression_t expression;
-    char expression_name[32];
-    
-    // Servo
-    int servo_index;
-    float servo_angle;
-    bool servo_smooth;
-    
-    // IR
-    uint16_t ir_address;
-    uint16_t ir_command;
-    int ir_repeat;
-    
-    // LEDs
-    struct {
-        uint8_t r, g, b;
-    } led_colors[12];
-    int led_count;
-    char led_pattern[16];
-    float led_speed;
-    
-    // Audio
-    int tone_freq;
-    int tone_duration;
-    int volume;
-    
-    // Other
-    int brightness;
-    char wifi_ssid[64];
-    char wifi_pass[64];
-    
-    // Generic
-    int seq_id;
-} command_t;
+    cmd_type_t type;
+    char raw_json[UDP_CMD_BUFFER_SIZE];
 
-// Status sent to server
+    // Parsed fields
+    union {
+        struct {        // CMD_HEAD
+            float pan;
+            float tilt;
+            uint16_t speed;
+            bool has_pan;
+            bool has_tilt;
+        } head;
+
+        struct {        // CMD_FACE
+            char expression[32];
+            uint32_t tween_ms;
+            bool has_tween;
+        } face;
+
+        struct {        // CMD_LED
+            char mode[16];
+            uint8_t r, g, b;
+            uint8_t brightness;
+            int leds[12];
+            int led_count;
+        } led;
+
+        struct {        // CMD_IR
+            uint16_t address;
+            uint16_t command;
+            int repeat;
+        } ir;
+
+        struct {        // CMD_SCREEN
+            uint8_t brightness;
+            bool clear;
+        } screen;
+
+        struct {        // CMD_EMOTE
+            char expression[32];
+            int repeat;
+        } emote;
+
+        struct {        // CMD_SPEAK_START
+            int sample_rate;
+        } speak_start;
+
+        struct {        // CMD_CUSTOM - all expression params
+            expression_params_t expr_params;
+        } custom;
+
+        char raw_text[512]; // Generic raw text for debug
+    };
+
+    int error_line;     // JSON parse error line (0 = no error)
+} udp_command_t;
+
+// Status data sent to A7S
 typedef struct {
-    float servo_angle[2];
-    expression_name_t expression;
-    int led_pattern;
-    int wifi_rssi;
+    float battery_voltage;
+    float battery_percent;
+    float imu_accel_x, imu_accel_y, imu_accel_z;
+    float imu_gyro_x, imu_gyro_y, imu_gyro_z;
+    float imu_temp;
+    bool touch_touched;
+    uint16_t touch_x, touch_y;
     uint32_t uptime_ms;
-    uint32_t heap_free;
-    bool mic_active;
-    bool spkr_active;
-    int seq_id;
-} status_t;
+    int16_t servo_pan_pos;
+    int16_t servo_tilt_pos;
+    uint8_t servo_pan_temp;
+    uint8_t servo_tilt_temp;
+    char current_expression[32];
+    int wifi_rssi;
+    uint32_t free_heap;
+    uint32_t free_psram;
+} status_data_t;
 
-// UDP client context
-typedef struct {
-    // Socket
-    int sock;
-    struct sockaddr_in server_addr;
-    bool connected;
-    
-    // WiFi
-    bool wifi_connected;
-    char wifi_ssid[32];
-    
+// UDP command callback type
+typedef void (*udp_cmd_callback_t)(const udp_command_t& cmd, void* user_arg);
+
+class UDPClient {
+public:
+    UDPClient();
+    ~UDPClient();
+
+    // Initialize UDP sockets and start tasks
+    bool begin();
+
+    // Send status data to A7S
+    void send_status(const status_data_t& status);
+
+    // Send audio data to A7S
+    void send_audio(const int16_t* data, size_t samples);
+
+    // Send arbitrary data (JSON string) to status port
+    void send_json(const char* json_str);
+
+    // Register command callback
+    void set_command_callback(udp_cmd_callback_t callback, void* user_arg);
+
+    // Get next command from queue (non-blocking)
+    bool get_command(udp_command_t* cmd);
+
+    // Is connected / initialized
+    bool is_connected() const { return m_initialized; }
+
+    // Set A7S host address
+    void set_a7s_host(const char* hostname);
+
+private:
+    bool m_initialized;
+    char m_a7s_host[128];
+
+    // Socket handles
+    int m_cmd_sock;     // UDP listen socket for commands
+    int m_status_sock;  // UDP send socket for status
+    int m_audio_sock;   // UDP send socket for audio
+
+    // A7S addresses (resolved once or periodically)
+    struct sockaddr_in m_status_addr;
+    struct sockaddr_in m_audio_addr;
+    bool m_addr_resolved;
+
     // Command queue
-    QueueHandle_t cmd_queue;
-    
-    // IP of server (set after first received packet)
-    uint32_t server_ip;
-    uint16_t server_port;
-    
-    // Receive buffer
-    uint8_t rx_buf[UDP_RX_BUFFER_SIZE];
-    
-    bool initialized;
-} udp_client_t;
+    QueueHandle_t m_cmd_queue;
 
-// Initialize UDP client (creates socket, starts WiFi)
-int udp_client_init(udp_client_t* client, const char* ssid, const char* password);
+    // Command callback
+    udp_cmd_callback_t m_cmd_callback;
+    void* m_cmd_callback_arg;
 
-// Start listening for UDP commands (creates receive task)
-int udp_client_start(udp_client_t* client);
+    // Task handles
+    TaskHandle_t m_recv_task;
+    TaskHandle_t m_status_task;
 
-// Send status to the server that last sent us data
-int udp_client_send_status(udp_client_t* client, const status_t* status);
+    // Task functions (static)
+    static void recv_task_func(void* arg);
+    static void status_task_func(void* arg);
 
-// Send raw data to server
-int udp_client_send(udp_client_t* client, const uint8_t* data, size_t len);
-
-// Send audio data to server
-int udp_client_send_audio(udp_client_t* client, const int16_t* audio, size_t num_samples);
-
-// Pop a command from the queue (non-blocking)
-// Returns true if a command was received
-bool udp_client_receive(udp_client_t* client, command_t* cmd, TickType_t timeout_ticks);
-
-// Parse a JSON command string into a command_t structure
-// Returns CMD_NONE on parse failure
-command_type_t udp_client_parse_json(const char* json_str, command_t* cmd);
-
-// Convert command type to string
-const char* udp_client_cmd_to_str(command_type_t type);
-
-// Stop and cleanup
-void udp_client_deinit(udp_client_t* client);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif // A7S_UDP_CLIENT_H
+    // Internal helpers
+    bool resolve_host();
+    bool parse_json(const char* json, udp_command_t* cmd);
+    bool parse_json_number(const char* json, const char* key, float* value);
+    bool parse_json_int(const char* json, const char* key, int* value);
+    bool parse_json_string(const char* json, const char* key, char* value, int max_len);
+    bool parse_json_bool(const char* json, const char* key, bool* value);
+    char* find_json_key(const char* json, const char* key);
+};

@@ -1,627 +1,518 @@
 #include "udp_client.h"
-#include "esp_log.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
-#include "lwip/err.h"
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/err.h"
 
-static const char* TAG = "udp";
+static const char* TAG = "UDPClient";
 
-// Simple JSON parser (no external dependency)
-// Supports: {"key": value, "key2": "string"} structures
-// Returns NULL on failure
+// JSON parsing buffer
+#define JSON_TOKEN_MAX 128
 
-static const char* json_skip_whitespace(const char* p) {
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    return p;
+UDPClient::UDPClient()
+    : m_initialized(false)
+    , m_cmd_sock(-1)
+    , m_status_sock(-1)
+    , m_audio_sock(-1)
+    , m_addr_resolved(false)
+    , m_cmd_queue(nullptr)
+    , m_cmd_callback(nullptr)
+    , m_cmd_callback_arg(nullptr)
+    , m_recv_task(nullptr)
+    , m_status_task(nullptr)
+{
+    strncpy(m_a7s_host, "a7.local", sizeof(m_a7s_host) - 1);
+    memset(&m_status_addr, 0, sizeof(m_status_addr));
+    memset(&m_audio_addr, 0, sizeof(m_audio_addr));
 }
 
-static const char* json_find_key(const char* json, const char* key) {
-    if (!json || !key) return NULL;
-    
-    const char* p = json;
-    int key_len = strlen(key);
-    
-    while (*p) {
-        p = strchr(p, '"');
-        if (!p) return NULL;
-        p++; // Skip opening quote
-        
-        // Check if this key matches
-        if (strncmp(p, key, key_len) == 0 && p[key_len] == '"') {
-            p += key_len + 1; // Skip key and closing quote
-            p = json_skip_whitespace(p);
-            if (*p == ':') {
-                p++;
-                return json_skip_whitespace(p);
-            }
-        }
-        
-        // Skip to next quote
-        p = strchr(p, '"');
-        if (!p) return NULL;
-        p++;
+UDPClient::~UDPClient() {
+    m_initialized = false;
+
+    if (m_recv_task) {
+        vTaskDelete(m_recv_task);
+        m_recv_task = nullptr;
     }
-    return NULL;
-}
 
-static const char* json_extract_string(const char* p, char* out, int max_len) {
-    if (!p || *p != '"') return NULL;
-    p++; // Skip opening quote
-    
-    int i = 0;
-    while (*p && *p != '"' && i < max_len - 1) {
-        if (*p == '\\') {
-            p++;
-            if (*p == '"') { out[i++] = '"'; p++; continue; }
-            if (*p == 'n') { out[i++] = '\n'; p++; continue; }
-            if (*p == '\\') { out[i++] = '\\'; p++; continue; }
-        }
-        out[i++] = *p;
-        p++;
+    if (m_status_task) {
+        vTaskDelete(m_status_task);
+        m_status_task = nullptr;
     }
-    out[i] = '\0';
-    
-    if (*p == '"') p++;
-    return p;
-}
 
-static float json_extract_number(const char* p, bool* success) {
-    if (success) *success = false;
-    if (!p) return 0.0f;
-    
-    char* end = NULL;
-    float val = strtof(p, &end);
-    if (end != p) {
-        if (success) *success = true;
+    if (m_cmd_sock >= 0) {
+        close(m_cmd_sock);
     }
-    return val;
-}
 
-static int json_extract_int(const char* p, bool* success) {
-    return (int)json_extract_number(p, success);
-}
-
-static bool json_extract_bool(const char* p, bool* success) {
-    if (success) *success = false;
-    if (!p) return false;
-    
-    if (strncmp(p, "true", 4) == 0) {
-        if (success) *success = true;
-        return true;
+    if (m_status_sock >= 0) {
+        close(m_status_sock);
     }
-    if (strncmp(p, "false", 5) == 0) {
-        if (success) *success = true;
+
+    if (m_audio_sock >= 0) {
+        close(m_audio_sock);
+    }
+
+    if (m_cmd_queue) {
+        vQueueDelete(m_cmd_queue);
+    }
+}
+
+bool UDPClient::begin() {
+    // Create command queue
+    m_cmd_queue = xQueueCreate(10, sizeof(udp_command_t));
+    if (!m_cmd_queue) {
+        ESP_LOGE(TAG, "Failed to create command queue");
         return false;
     }
+
+    // Create command listening socket
+    m_cmd_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_cmd_sock < 0) {
+        ESP_LOGE(TAG, "Failed to create command socket: %d", errno);
+        return false;
+    }
+
+    // Set socket timeout
+    struct timeval tv = {
+        .tv_sec = 1,
+        .tv_usec = 0,
+    };
+    setsockopt(m_cmd_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Bind to command port
+    struct sockaddr_in bind_addr = {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(UDP_CMD_PORT);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(m_cmd_sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        ESP_LOGE(TAG, "Failed to bind command socket: %d", errno);
+        close(m_cmd_sock);
+        m_cmd_sock = -1;
+        return false;
+    }
+
+    // Create status send socket
+    m_status_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_status_sock < 0) {
+        ESP_LOGE(TAG, "Failed to create status socket");
+        close(m_cmd_sock);
+        m_cmd_sock = -1;
+        return false;
+    }
+
+    // Create audio send socket
+    m_audio_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (m_audio_sock < 0) {
+        ESP_LOGE(TAG, "Failed to create audio socket");
+        close(m_cmd_sock);
+        close(m_status_sock);
+        m_cmd_sock = -1;
+        m_status_sock = -1;
+        return false;
+    }
+
+    // Resolve A7S host address
+    resolve_host();
+
+    // Start command receive task
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        recv_task_func,
+        "udp_recv",
+        8192,
+        this,
+        5,
+        &m_recv_task,
+        0
+    );
+
+    if (ret != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create recv task");
+        return false;
+    }
+
+    m_initialized = true;
+    ESP_LOGI(TAG, "UDP client initialized - listening on port %d", UDP_CMD_PORT);
+    return true;
+}
+
+void UDPClient::send_status(const status_data_t& status) {
+    if (!m_initialized || !m_addr_resolved) {
+        // Re-resolve
+        if (!resolve_host()) return;
+    }
+
+    // Build JSON status string
+    char json_buf[1024];
+    int len = snprintf(json_buf, sizeof(json_buf),
+        "{"
+        "\"type\":\"status\","
+        "\"bat_v\":%.2f,"
+        "\"bat_pct\":%.1f,"
+        "\"accel\":[%.2f,%.2f,%.2f],"
+        "\"gyro\":[%.2f,%.2f,%.2f],"
+        "\"temp\":%.1f,"
+        "\"touch\":%s,"
+        "\"touch_xy\":[%u,%u],"
+        "\"uptime\":%lu,"
+        "\"servo_pan\":%d,"
+        "\"servo_tilt\":%d,"
+        "\"pan_temp\":%u,"
+        "\"tilt_temp\":%u,"
+        "\"expression\":\"%s\","
+        "\"rssi\":%d,"
+        "\"heap\":%lu,"
+        "\"psram\":%lu"
+        "}",
+        status.battery_voltage,
+        status.battery_percent,
+        status.imu_accel_x, status.imu_accel_y, status.imu_accel_z,
+        status.imu_gyro_x, status.imu_gyro_y, status.imu_gyro_z,
+        status.imu_temp,
+        status.touch_touched ? "true" : "false",
+        status.touch_x, status.touch_y,
+        (unsigned long)status.uptime_ms,
+        status.servo_pan_pos,
+        status.servo_tilt_pos,
+        status.servo_pan_temp,
+        status.servo_tilt_temp,
+        status.current_expression,
+        status.wifi_rssi,
+        (unsigned long)status.free_heap,
+        (unsigned long)status.free_psram
+    );
+
+    sendto(m_status_sock, json_buf, len, 0,
+           (struct sockaddr*)&m_status_addr, sizeof(m_status_addr));
+}
+
+void UDPClient::send_audio(const int16_t* data, size_t samples) {
+    if (!m_initialized || !m_addr_resolved || !data || samples == 0) return;
+
+    // Send raw PCM16 audio data
+    // Format: 16-bit signed mono PCM
+    size_t bytes = samples * sizeof(int16_t);
+    sendto(m_audio_sock, data, bytes, 0,
+           (struct sockaddr*)&m_audio_addr, sizeof(m_audio_addr));
+}
+
+void UDPClient::send_json(const char* json_str) {
+    if (!m_initialized || !m_addr_resolved || !json_str) return;
+
+    size_t len = strlen(json_str);
+    sendto(m_status_sock, json_str, len, 0,
+           (struct sockaddr*)&m_status_addr, sizeof(m_status_addr));
+}
+
+void UDPClient::set_command_callback(udp_cmd_callback_t callback, void* user_arg) {
+    m_cmd_callback = callback;
+    m_cmd_callback_arg = user_arg;
+}
+
+bool UDPClient::get_command(udp_command_t* cmd) {
+    if (!m_cmd_queue) return false;
+    return xQueueReceive(m_cmd_queue, cmd, 0) == pdTRUE;
+}
+
+void UDPClient::set_a7s_host(const char* hostname) {
+    if (hostname) {
+        strncpy(m_a7s_host, hostname, sizeof(m_a7s_host) - 1);
+        m_a7s_host[sizeof(m_a7s_host) - 1] = '\0';
+        m_addr_resolved = false;
+        resolve_host();
+    }
+}
+
+bool UDPClient::resolve_host() {
+    struct addrinfo hints = {};
+    struct addrinfo* result = nullptr;
+
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", A7S_STATUS_PORT);
+
+    int err = getaddrinfo(m_a7s_host, port_str, &hints, &result);
+    if (err != 0 || !result) {
+        ESP_LOGW(TAG, "Failed to resolve %s (will retry)", m_a7s_host);
+        return false;
+    }
+
+    // Use first resolved address for status
+    struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
+    memcpy(&m_status_addr, addr, sizeof(struct sockaddr_in));
+    m_status_addr.sin_port = htons(A7S_STATUS_PORT);
+
+    // Same address, different port for audio
+    memcpy(&m_audio_addr, addr, sizeof(struct sockaddr_in));
+    m_audio_addr.sin_port = htons(A7S_AUDIO_PORT);
+
+    freeaddrinfo(result);
+
+    m_addr_resolved = true;
+    ESP_LOGI(TAG, "Resolved %s to %s:%d", m_a7s_host,
+             inet_ntoa(m_status_addr.sin_addr), ntohs(m_status_addr.sin_port));
+    return true;
+}
+
+// ============================================================
+// Receive task
+// ============================================================
+
+void UDPClient::recv_task_func(void* arg) {
+    UDPClient* self = static_cast<UDPClient*>(arg);
+
+    while (self->m_initialized) {
+        struct sockaddr_in sender_addr;
+        socklen_t addr_len = sizeof(sender_addr);
+        char buffer[UDP_MAX_PACKET_SIZE];
+
+        int n = recvfrom(self->m_cmd_sock, buffer, sizeof(buffer) - 1, 0,
+                         (struct sockaddr*)&sender_addr, &addr_len);
+
+        if (n > 0) {
+            buffer[n] = '\0';
+
+            ESP_LOGI(TAG, "Received %d bytes from %s:%d: %s",
+                     n, inet_ntoa(sender_addr.sin_addr),
+                     ntohs(sender_addr.sin_port), buffer);
+
+            // Parse command JSON
+            udp_command_t cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            strncpy(cmd.raw_json, buffer, sizeof(cmd.raw_json) - 1);
+
+            if (self->parse_json(buffer, &cmd)) {
+                if (self->m_cmd_callback) {
+                    self->m_cmd_callback(cmd, self->m_cmd_callback_arg);
+                }
+
+                // Also enqueue for main loop polling
+                if (self->m_cmd_queue) {
+                    xQueueSend(self->m_cmd_queue, &cmd, 0);
+                }
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ESP_LOGW(TAG, "Socket error: %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        // Yield to other tasks
+        taskYIELD();
+    }
+
+    vTaskDelete(NULL);
+}
+
+// ============================================================
+// JSON parsing
+// ============================================================
+
+bool UDPClient::parse_json(const char* json, udp_command_t* cmd) {
+    if (!json || !cmd) return false;
+
+    // Detect command type from top-level key
+    cmd->type = CMD_NONE;
+
+    // Simple linear scan for known keys
+    if (strstr(json, "\"head\"")) {
+        cmd->type = CMD_HEAD;
+        parse_json_number(json, "\"pan\"", &cmd->head.pan);
+        parse_json_number(json, "\"tilt\"", &cmd->head.tilt);
+        parse_json_int(json, "\"speed\"", (int*)&cmd->head.speed);
+        cmd->head.has_pan = true;
+        cmd->head.has_tilt = true;
+        return true;
+    }
+
+    if (strstr(json, "\"face\"")) {
+        cmd->type = CMD_FACE;
+        parse_json_string(json, "\"expression\"", cmd->face.expression, sizeof(cmd->face.expression));
+        int tween = 0;
+        if (parse_json_int(json, "\"tween_ms\"", &tween)) {
+            cmd->face.tween_ms = tween;
+            cmd->face.has_tween = true;
+        }
+        return true;
+    }
+
+    if (strstr(json, "\"led\"")) {
+        cmd->type = CMD_LED;
+        parse_json_string(json, "\"mode\"", cmd->led.mode, sizeof(cmd->led.mode));
+        int val = 0;
+        if (parse_json_int(json, "\"r\"", &val)) cmd->led.r = val;
+        if (parse_json_int(json, "\"g\"", &val)) cmd->led.g = val;
+        if (parse_json_int(json, "\"b\"", &val)) cmd->led.b = val;
+        if (parse_json_int(json, "\"brightness\"", &val)) cmd->led.brightness = val;
+        return true;
+    }
+
+    if (strstr(json, "\"ir\"")) {
+        cmd->type = CMD_IR;
+        int val = 0;
+        if (parse_json_int(json, "\"address\"", &val)) cmd->ir.address = val;
+        if (parse_json_int(json, "\"command\"", &val)) cmd->ir.command = val;
+        parse_json_int(json, "\"repeat\"", &cmd->ir.repeat);
+        return true;
+    }
+
+    if (strstr(json, "\"screen\"")) {
+        cmd->type = CMD_SCREEN;
+        int val = 0;
+        if (parse_json_int(json, "\"brightness\"", &val)) cmd->screen.brightness = val;
+        parse_json_bool(json, "\"clear\"", &cmd->screen.clear);
+        return true;
+    }
+
+    if (strstr(json, "\"emote\"")) {
+        cmd->type = CMD_EMOTE;
+        parse_json_string(json, "\"expression\"", cmd->emote.expression, sizeof(cmd->emote.expression));
+        parse_json_int(json, "\"repeat\"", &cmd->emote.repeat);
+        return true;
+    }
+
+    if (strstr(json, "\"speak_start\"")) {
+        cmd->type = CMD_SPEAK_START;
+        parse_json_int(json, "\"sample_rate\"", &cmd->speak_start.sample_rate);
+        return true;
+    }
+
+    if (strstr(json, "\"speak_data\"")) {
+        cmd->type = CMD_SPEAK_DATA;
+        return true;
+    }
+
+    if (strstr(json, "\"speak_stop\"")) {
+        cmd->type = CMD_SPEAK_STOP;
+        return true;
+    }
+
+    // Fallback: check for bare command type key
+    if (strstr(json, "\"type\"")) {
+        char type_str[32];
+        if (parse_json_string(json, "\"type\"", type_str, sizeof(type_str))) {
+            if (strcmp(type_str, "head") == 0) {
+                cmd->type = CMD_HEAD;
+                parse_json_number(json, "\"pan\"", &cmd->head.pan);
+                parse_json_number(json, "\"tilt\"", &cmd->head.tilt);
+                return true;
+            }
+            if (strcmp(type_str, "face") == 0) {
+                cmd->type = CMD_FACE;
+                parse_json_string(json, "\"expression\"", cmd->face.expression, sizeof(cmd->face.expression));
+                return true;
+            }
+            if (strcmp(type_str, "led") == 0) {
+                cmd->type = CMD_LED;
+                return true;
+            }
+            if (strcmp(type_str, "ir") == 0) {
+                cmd->type = CMD_IR;
+                return true;
+            }
+            if (strcmp(type_str, "screen") == 0) {
+                cmd->type = CMD_SCREEN;
+                return true;
+            }
+            if (strcmp(type_str, "emote") == 0) {
+                cmd->type = CMD_EMOTE;
+                return true;
+            }
+            if (strcmp(type_str, "speak_start") == 0) {
+                cmd->type = CMD_SPEAK_START;
+                return true;
+            }
+            if (strcmp(type_str, "speak_data") == 0) {
+                cmd->type = CMD_SPEAK_DATA;
+                return true;
+            }
+            if (strcmp(type_str, "speak_stop") == 0) {
+                cmd->type = CMD_SPEAK_STOP;
+                return true;
+            }
+        }
+    }
+
+    ESP_LOGW(TAG, "Unknown command type: %s", json);
     return false;
 }
 
-// Command name lookup table
-typedef struct {
-    const char* name;
-    command_type_t type;
-} cmd_lookup_t;
+char* UDPClient::find_json_key(const char* json, const char* key) {
+    if (!json || !key) return nullptr;
 
-static const cmd_lookup_t s_cmd_lookup[] = {
-    {"set_expression",      CMD_SET_EXPRESSION},
-    {"set_expression_raw",  CMD_SET_EXPRESSION_RAW},
-    {"set_servo",           CMD_SET_SERVO},
-    {"set_servo_smooth",    CMD_SET_SERVO_SMOOTH},
-    {"send_ir",             CMD_SEND_IR},
-    {"set_leds",            CMD_SET_LEDS},
-    {"set_led_pattern",     CMD_SET_LED_PATTERN},
-    {"play_tone",           CMD_PLAY_TONE},
-    {"play_audio",          CMD_PLAY_AUDIO},
-    {"set_volume",          CMD_SET_VOLUME},
-    {"set_brightness",      CMD_SET_BRIGHTNESS},
-    {"get_status",          CMD_GET_STATUS},
-    {"reboot",              CMD_REBOOT},
-    {"ota_update",          CMD_OTA_UPDATE},
-    {"set_wifi",            CMD_SET_WIFI},
-    {"calibrate",           CMD_CALIBRATE},
-    {"ping",                CMD_PING},
-    {NULL,                  CMD_NONE}
-};
+    const char* found = strstr(json, key);
+    if (!found) return nullptr;
 
-static command_type_t lookup_command_type(const char* name) {
-    for (int i = 0; s_cmd_lookup[i].name != NULL; i++) {
-        if (strcmp(name, s_cmd_lookup[i].name) == 0) {
-            return s_cmd_lookup[i].type;
-        }
+    // Skip past the key and colon
+    found += strlen(key);
+    while (*found && (*found == ' ' || *found == ':' || *found == '\t')) {
+        found++;
     }
-    return CMD_UNKNOWN;
+
+    return (char*)found;
 }
 
-const char* udp_client_cmd_to_str(command_type_t type) {
-    for (int i = 0; s_cmd_lookup[i].name != NULL; i++) {
-        if (s_cmd_lookup[i].type == type) {
-            return s_cmd_lookup[i].name;
-        }
-    }
-    return "unknown";
+bool UDPClient::parse_json_number(const char* json, const char* key, float* value) {
+    char* val_start = find_json_key(json, key);
+    if (!val_start) return false;
+
+    char* end = nullptr;
+    float v = strtof(val_start, &end);
+    if (end == val_start) return false;
+
+    *value = v;
+    return true;
 }
 
-command_type_t udp_client_parse_json(const char* json_str, command_t* cmd) {
-    if (!json_str || !cmd) return CMD_NONE;
-    
-    memset(cmd, 0, sizeof(command_t));
-    
-    // Extract command type
-    const char* val = json_find_key(json_str, "cmd");
-    if (!val) {
-        val = json_find_key(json_str, "command");
-    }
-    if (!val) return CMD_NONE;
-    
-    char cmd_name[32];
-    const char* end = json_extract_string(val, cmd_name, sizeof(cmd_name));
-    if (!end) return CMD_NONE;
-    
-    cmd->type = lookup_command_type(cmd_name);
-    strncpy(cmd->cmd_name, cmd_name, sizeof(cmd->cmd_name) - 1);
-    
-    if (cmd->type == CMD_NONE) return CMD_NONE;
-    
-    // Extract sequence ID
-    bool success;
-    val = json_find_key(json_str, "seq");
-    if (val) {
-        cmd->seq_id = json_extract_int(val, &success);
-    }
-    val = json_find_key(json_str, "id");
-    if (val && !cmd->seq_id) {
-        cmd->seq_id = json_extract_int(val, &success);
-    }
-    
-    // Parse command-specific parameters
-    switch (cmd->type) {
-        case CMD_SET_EXPRESSION: {
-            val = json_find_key(json_str, "expression");
-            if (val) {
-                json_extract_string(val, cmd->expression_name, sizeof(cmd->expression_name));
-            }
-            break;
-        }
-        
-        case CMD_SET_EXPRESSION_RAW: {
-            #define GET_FLOAT(key, field) do { \
-                val = json_find_key(json_str, key); \
-                if (val) cmd->expression.field = json_extract_number(val, &success); \
-            } while(0)
-            
-            GET_FLOAT("eye_open", eye_open);
-            GET_FLOAT("eye_height", eye_height);
-            GET_FLOAT("eye_width", eye_width);
-            GET_FLOAT("pupil_x", pupil_x);
-            GET_FLOAT("pupil_y", pupil_y);
-            GET_FLOAT("brow_angle", brow_angle);
-            GET_FLOAT("brow_height", brow_height);
-            GET_FLOAT("mouth_open", mouth_open);
-            GET_FLOAT("mouth_curve", mouth_curve);
-            GET_FLOAT("blush", blush);
-            GET_FLOAT("tear", tear);
-            GET_FLOAT("heart_eyes", heart_eyes);
-            GET_FLOAT("exclamation", exclamation);
-            
-            #undef GET_FLOAT
-            break;
-        }
-        
-        case CMD_SET_SERVO:
-        case CMD_SET_SERVO_SMOOTH: {
-            val = json_find_key(json_str, "index");
-            if (val) cmd->servo_index = json_extract_int(val, &success);
-            
-            val = json_find_key(json_str, "angle");
-            if (val) cmd->servo_angle = json_extract_number(val, &success);
-            
-            cmd->servo_smooth = (cmd->type == CMD_SET_SERVO_SMOOTH);
-            break;
-        }
-        
-        case CMD_SEND_IR: {
-            val = json_find_key(json_str, "address");
-            if (val) cmd->ir_address = (uint16_t)json_extract_int(val, &success);
-            
-            val = json_find_key(json_str, "command");
-            if (val) cmd->ir_command = (uint16_t)json_extract_int(val, &success);
-            
-            val = json_find_key(json_str, "repeat");
-            if (val) cmd->ir_repeat = json_extract_int(val, &success);
-            break;
-        }
-        
-        case CMD_SET_LEDS: {
-            // Parse LED array: "leds": [[r,g,b], ...]
-            val = json_find_key(json_str, "leds");
-            if (val) {
-                // Parse the array manually
-                // Format: [[r,g,b],[r,g,b],...] or just count + one color
-                if (*val == '[') {
-                    val++;
-                    int led_idx = 0;
-                    while (*val && *val != ']' && led_idx < 12) {
-                        val = json_skip_whitespace(val);
-                        if (*val == '[') {
-                            val++;
-                            int rgb[3] = {0, 0, 0};
-                            for (int c = 0; c < 3; c++) {
-                                val = json_skip_whitespace(val);
-                                float num = strtof(val, (char**)&val);
-                                rgb[c] = (int)num;
-                                val = json_skip_whitespace(val);
-                                if (*val == ',') val++;
-                            }
-                            cmd->led_colors[led_idx].r = (uint8_t)rgb[0];
-                            cmd->led_colors[led_idx].g = (uint8_t)rgb[1];
-                            cmd->led_colors[led_idx].b = (uint8_t)rgb[2];
-                            led_idx++;
-                            val = json_skip_whitespace(val);
-                            if (*val == ']') val++;
-                            val = json_skip_whitespace(val);
-                            if (*val == ',') val++;
-                        }
-                    }
-                    cmd->led_count = led_idx;
-                }
-            }
-            
-            // Also check for single r, g, b fields
-            val = json_find_key(json_str, "r");
-            if (val && cmd->led_count == 0) {
-                uint8_t r = (uint8_t)json_extract_int(val, &success);
-                val = json_find_key(json_str, "g");
-                uint8_t g = val ? (uint8_t)json_extract_int(val, &success) : 0;
-                val = json_find_key(json_str, "b");
-                uint8_t b = val ? (uint8_t)json_extract_int(val, &success) : 0;
-                for (int i = 0; i < 12; i++) {
-                    cmd->led_colors[i].r = r;
-                    cmd->led_colors[i].g = g;
-                    cmd->led_colors[i].b = b;
-                }
-                cmd->led_count = 12;
-            }
-            break;
-        }
-        
-        case CMD_SET_LED_PATTERN: {
-            val = json_find_key(json_str, "pattern");
-            if (val) {
-                json_extract_string(val, cmd->led_pattern, sizeof(cmd->led_pattern));
-            }
-            
-            // Extract color
-            val = json_find_key(json_str, "r");
-            uint8_t r = val ? (uint8_t)json_extract_int(val, &success) : 255;
-            val = json_find_key(json_str, "g");
-            uint8_t g = val ? (uint8_t)json_extract_int(val, &success) : 255;
-            val = json_find_key(json_str, "b");
-            uint8_t b = val ? (uint8_t)json_extract_int(val, &success) : 255;
-            
-            val = json_find_key(json_str, "speed");
-            cmd->led_speed = val ? json_extract_number(val, &success) : 0.5f;
-            
-            for (int i = 0; i < 12; i++) {
-                cmd->led_colors[i].r = r;
-                cmd->led_colors[i].g = g;
-                cmd->led_colors[i].b = b;
-            }
-            cmd->led_count = 12;
-            break;
-        }
-        
-        case CMD_PLAY_TONE: {
-            val = json_find_key(json_str, "freq");
-            if (val) cmd->tone_freq = json_extract_int(val, &success);
-            
-            val = json_find_key(json_str, "duration");
-            if (val) cmd->tone_duration = json_extract_int(val, &success);
-            break;
-        }
-        
-        case CMD_SET_VOLUME: {
-            val = json_find_key(json_str, "volume");
-            if (val) cmd->volume = json_extract_int(val, &success);
-            break;
-        }
-        
-        case CMD_SET_BRIGHTNESS: {
-            val = json_find_key(json_str, "brightness");
-            if (val) cmd->brightness = json_extract_int(val, &success);
-            break;
-        }
-        
-        case CMD_SET_WIFI: {
-            val = json_find_key(json_str, "ssid");
-            if (val) json_extract_string(val, cmd->wifi_ssid, sizeof(cmd->wifi_ssid));
-            
-            val = json_find_key(json_str, "password");
-            if (val) json_extract_string(val, cmd->wifi_pass, sizeof(cmd->wifi_pass));
-            break;
-        }
-        
-        default:
-            break;
-    }
-    
-    return cmd->type;
+bool UDPClient::parse_json_int(const char* json, const char* key, int* value) {
+    char* val_start = find_json_key(json, key);
+    if (!val_start) return false;
+
+    char* end = nullptr;
+    long v = strtol(val_start, &end, 0); // base 0 for hex support
+    if (end == val_start) return false;
+
+    *value = static_cast<int>(v);
+    return true;
 }
 
-// WiFi event handler
-static EventGroupHandle_t s_wifi_event_group;
-static const int WIFI_CONNECTED_BIT = BIT0;
-static const int WIFI_FAIL_BIT     = BIT1;
+bool UDPClient::parse_json_string(const char* json, const char* key, char* value, int max_len) {
+    char* val_start = find_json_key(json, key);
+    if (!val_start) return false;
 
-static void event_handler(void* arg, esp_event_base_t event_base,
-                           int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_wifi_event_group) {
-            // Don't set fail immediately, let retry logic handle it
-            esp_wifi_connect();
-        }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        if (s_wifi_event_group) {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        }
-    }
+    // Expect opening quote
+    if (*val_start != '"') return false;
+    val_start++;
+
+    // Find closing quote
+    const char* val_end = strchr(val_start, '"');
+    if (!val_end) return false;
+
+    int len = val_end - val_start;
+    if (len >= max_len) len = max_len - 1;
+
+    strncpy(value, val_start, len);
+    value[len] = '\0';
+    return true;
 }
 
-int udp_client_init(udp_client_t* client, const char* ssid, const char* password) {
-    memset(client, 0, sizeof(udp_client_t));
-    client->sock = -1;
-    client->server_port = UDP_PORT;
-    client->cmd_queue = xQueueCreate(10, sizeof(command_t));
-    
-    // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-    
-    // Initialize network interface
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    
-    // Initialize WiFi
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                         &event_handler, NULL, &instance_any_id);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                         &event_handler, NULL, &instance_got_ip);
-    
-    // Configure WiFi
-    wifi_config_t wifi_config = {};
-    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
-    
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
-    
-    // Wait for connection
-    s_wifi_event_group = xEventGroupCreate();
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
-    
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WiFi connected to %s", ssid);
-        client->wifi_connected = true;
-        strncpy(client->wifi_ssid, ssid, sizeof(client->wifi_ssid) - 1);
-    } else {
-        ESP_LOGE(TAG, "WiFi connection failed");
-        client->wifi_connected = false;
-    }
-    
-    vEventGroupDelete(s_wifi_event_group);
-    s_wifi_event_group = NULL;
-    
-    // Create UDP socket
-    client->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (client->sock < 0) {
-        ESP_LOGE(TAG, "Failed to create UDP socket");
-        return -1;
-    }
-    
-    // Set socket timeout
-    struct timeval tv = {
-        .tv_sec = 0,
-        .tv_usec = 100000  // 100ms timeout for recv
-    };
-    setsockopt(client->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    // Bind to listen on UDP port
-    struct sockaddr_in bind_addr = {};
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(UDP_PORT);
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    
-    if (bind(client->sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-        ESP_LOGE(TAG, "Failed to bind UDP socket");
-        close(client->sock);
-        client->sock = -1;
-        return -1;
-    }
-    
-    client->initialized = true;
-    ESP_LOGI(TAG, "UDP client initialized on port %d", UDP_PORT);
-    return 0;
-}
+bool UDPClient::parse_json_bool(const char* json, const char* key, bool* value) {
+    char* val_start = find_json_key(json, key);
+    if (!val_start) return false;
 
-// UDP receive task
-static void udp_recv_task(void* arg) {
-    udp_client_t* client = (udp_client_t*)arg;
-    struct sockaddr_in source_addr;
-    socklen_t addr_len = sizeof(source_addr);
-    
-    ESP_LOGI(TAG, "UDP receive task started");
-    
-    while (true) {
-        if (client->sock < 0) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        
-        int len = recvfrom(client->sock, client->rx_buf, UDP_RX_BUFFER_SIZE - 1, 0,
-                           (struct sockaddr*)&source_addr, &addr_len);
-        
-        if (len > 0) {
-            client->rx_buf[len] = '\0';
-            
-            // Store the source address for reply
-            client->server_ip = source_addr.sin_addr.s_addr;
-            client->server_port = ntohs(source_addr.sin_port);
-            
-            ESP_LOGD(TAG, "Received %d bytes from " IPSTR ":%d: %s",
-                     len, IP2STR(&source_addr.sin_addr),
-                     ntohs(source_addr.sin_port), (char*)client->rx_buf);
-            
-            // Parse JSON command
-            command_t cmd;
-            command_type_t type = udp_client_parse_json((const char*)client->rx_buf, &cmd);
-            
-            if (type != CMD_NONE) {
-                // Queue for main loop
-                if (xQueueSend(client->cmd_queue, &cmd, 0) != pdTRUE) {
-                    ESP_LOGW(TAG, "Command queue full, dropping command");
-                }
-            }
-        }
+    if (strncmp(val_start, "true", 4) == 0) {
+        *value = true;
+        return true;
     }
-}
-
-int udp_client_start(udp_client_t* client) {
-    if (!client->initialized) return -1;
-    
-    // Create receive task on core 1
-    TaskHandle_t task_handle;
-    xTaskCreatePinnedToCore(udp_recv_task, "udp_recv", 4096, client, 5, &task_handle, 1);
-    
-    return 0;
-}
-
-int udp_client_send_status(udp_client_t* client, const status_t* status) {
-    if (client->sock < 0 || !client->server_ip) return -1;
-    
-    char json_buf[UDP_TX_BUFFER_SIZE];
-    int n = snprintf(json_buf, sizeof(json_buf),
-        "{"
-        "\"type\":\"status\","
-        "\"seq\":%d,"
-        "\"servo0\":%.1f,"
-        "\"servo1\":%.1f,"
-        "\"expr\":%d,"
-        "\"led_pattern\":%d,"
-        "\"rssi\":%d,"
-        "\"uptime\":%lu,"
-        "\"heap\":%lu,"
-        "\"mic\":%d,"
-        "\"spkr\":%d"
-        "}",
-        status->seq_id,
-        status->servo_angle[0],
-        status->servo_angle[1],
-        (int)status->expression,
-        status->led_pattern,
-        status->wifi_rssi,
-        (unsigned long)status->uptime_ms,
-        (unsigned long)status->heap_free,
-        status->mic_active ? 1 : 0,
-        status->spkr_active ? 1 : 0
-    );
-    
-    if (n <= 0) return -1;
-    
-    struct sockaddr_in dest_addr = {};
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(client->server_port);
-    dest_addr.sin_addr.s_addr = client->server_ip;
-    
-    int ret = sendto(client->sock, json_buf, n, 0,
-                     (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-    if (ret < 0) {
-        ESP_LOGW(TAG, "sendto failed: %d", ret);
+    if (strncmp(val_start, "false", 5) == 0) {
+        *value = false;
+        return true;
     }
-    
-    return ret;
-}
 
-int udp_client_send(udp_client_t* client, const uint8_t* data, size_t len) {
-    if (client->sock < 0 || !client->server_ip) return -1;
-    
-    struct sockaddr_in dest_addr = {};
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(client->server_port);
-    dest_addr.sin_addr.s_addr = client->server_ip;
-    
-    return sendto(client->sock, data, len, 0,
-                  (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-}
-
-int udp_client_send_audio(udp_client_t* client, const int16_t* audio, size_t num_samples) {
-    if (client->sock < 0 || !client->server_ip) return -1;
-    
-    // Create JSON wrapper for audio data (base64 not implemented - send as binary with header)
-    // For now, send as raw PCM data with a small text header
-    // Format: {"type":"audio","len":N}\n followed by raw PCM data
-    
-    char header[64];
-    int header_len = snprintf(header, sizeof(header),
-                              "{\"type\":\"audio\",\"len\":%u}\n", (unsigned)num_samples);
-    
-    // Send header first
-    struct sockaddr_in dest_addr = {};
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(client->server_port);
-    dest_addr.sin_addr.s_addr = client->server_ip;
-    
-    sendto(client->sock, header, header_len, 0,
-           (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-    
-    // Send PCM data
-    return sendto(client->sock, audio, num_samples * sizeof(int16_t), 0,
-                  (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-}
-
-bool udp_client_receive(udp_client_t* client, command_t* cmd, TickType_t timeout_ticks) {
-    if (!client->cmd_queue) return false;
-    return xQueueReceive(client->cmd_queue, cmd, timeout_ticks) == pdTRUE;
-}
-
-void udp_client_deinit(udp_client_t* client) {
-    if (client->sock >= 0) {
-        close(client->sock);
-        client->sock = -1;
-    }
-    
-    if (client->cmd_queue) {
-        vQueueDelete(client->cmd_queue);
-        client->cmd_queue = NULL;
-    }
-    
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    esp_event_loop_delete_default();
-    
-    client->initialized = false;
-    ESP_LOGI(TAG, "UDP client deinitialized");
+    return false;
 }

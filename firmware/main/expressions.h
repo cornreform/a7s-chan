@@ -1,80 +1,91 @@
-#ifndef A7S_EXPRESSIONS_H
-#define A7S_EXPRESSIONS_H
+#ifndef EXPRESSIONS_H
+#define EXPRESSIONS_H
 
 #include <cstdint>
 #include <cstring>
-#include <cmath>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Expression parameters for the robot face
+/**
+ * @brief Expression parameter struct for face rendering.
+ *
+ * All fields are normalized 0.0–1.0 unless otherwise noted.
+ */
 typedef struct {
-    // Eyes
-    float eye_open;       // 0.0 (closed) to 1.0 (fully open)
-    float eye_height;     // 0.0 (narrow) to 1.0 (tall), overall eye aspect ratio
-    float eye_width;      // 0.0 (narrow) to 1.0 (wide), overall eye width
+    float eye_open;       // 0.0=closed, 1.0=fully open
+    float eye_width;      // 0.0=narrow slit, 1.0=wide
+    float eye_height;     // 0.0=flat, 1.0=tall oval
+    float brow_angle;     // 0.0=neutral, 0.5=up, 1.0=down (mapped to degrees internally)
+    float brow_height;    // 0.0=low, 1.0=high
+    float mouth_open;     // 0.0=closed, 1.0=wide open
+    float mouth_curve;    // 0.0=frown, 0.5=neutral, 1.0=smile
+    float blush;          // 0.0=none, 1.0=full blush
+    float tears;          // 0.0=none, 1.0=full tears
+    float heart_eyes;     // 0.0=normal eyes, 1.0=heart eyes
+} expression_params_t;
 
-    // Pupils
-    float pupil_x;        // -1.0 (left) to 1.0 (right)
-    float pupil_y;        // -1.0 (down) to 1.0 (up)
-
-    // Brows
-    float brow_angle;     // -1.0 (angry inward) to 1.0 (worried raised outer)
-    float brow_height;    // -1.0 (lowered) to 1.0 (raised)
-
-    // Mouth
-    float mouth_open;     // 0.0 (closed) to 1.0 (fully open)
-    float mouth_curve;    // -1.0 (frown) to 1.0 (smile)
-
-    // Effects
-    float blush;          // 0.0 (none) to 1.0 (max blush)
-    float tear;           // 0.0 (none) to 1.0 (crying)
-    float heart_eyes;     // 0.0 (normal) to 1.0 (heart eyes)
-    float exclamation;    // 0.0 (none) to 1.0 (shock/emphasis mark)
-
-    // Meta
-    float blink_intensity; // 0.0 (normal) to 1.0 (forced blink override)
-} expression_t;
-
-// Named expression presets
+/**
+ * @brief Enumeration of all supported expressions.
+ */
 typedef enum {
-    EXPR_NEUTRAL,
-    EXPR_HAPPY,
+    EXPR_HAPPY = 0,
     EXPR_SAD,
     EXPR_ANGRY,
-    EXPR_SURPRISED,
-    EXPR_FEARFUL,
-    EXPR_DISGUSTED,
-    EXPR_LOVE,
-    EXPR_CRYING,
-    EXPR_ANNOYED,
-    EXPR_SLEEPY,
+    EXPR_SURPRISE,
+    EXPR_BLINK,
+    EXPR_IDLE,
+    EXPR_TALK,
+    EXPR_LISTEN,
+    EXPR_THINK,
+    EXPR_SLEEP,
+    EXPR_WAKE,
     EXPR_CONFUSED,
     EXPR_EXCITED,
-    EXPR_EMBARRASSED,
-    EXPR_LAUGHING,
+    EXPR_DANCE,
+    EXPR_LOVE,
     EXPR_WINK,
-    EXPR_SHOCK,
-    EXPR_THINKING,
+    EXPR_SWEAT,
+    EXPR_CRYING,
     EXPR_COUNT
-} expression_name_t;
+} expression_id_t;
 
-// Get a named expression preset
-const expression_t& expression_get(expression_name_t name);
+/**
+ * @brief Get expression parameters by ID.
+ * @param id Expression ID
+ * @return Pointer to const expression_params_t
+ */
+const expression_params_t* get_expression_params(expression_id_t id);
 
-// Linearly interpolate between two expressions by factor t (0.0 = a, 1.0 = b)
-expression_t expression_lerp(const expression_t& a, const expression_t& b, float t);
+/**
+ * @brief Get expression name string.
+ * @param id Expression ID
+ * @return Null-terminated name string
+ */
+const char* get_expression_name(expression_id_t id);
 
-// Set all fields to a single value
-void expression_set_all(expression_t& expr, float value);
+/**
+ * @brief Look up expression ID from name string.
+ * @param name Expression name (case-insensitive)
+ * @return Expression ID, or EXPR_IDLE if not found
+ */
+expression_id_t lookup_expression(const char* name);
 
-// Reset to neutral defaults
-void expression_reset(expression_t& expr);
+/**
+ * @brief Linearly interpolate between two expression parameter sets.
+ * @param from Starting expression
+ * @param to   Target expression
+ * @param t    Interpolation factor (0.0=from, 1.0=to)
+ * @param out  Output parameter set
+ */
+void lerp_expression(const expression_params_t* from,
+                     const expression_params_t* to,
+                     float t,
+                     expression_params_t* out);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // A7S_EXPRESSIONS_H
+#endif // EXPRESSIONS_H

@@ -1,11 +1,27 @@
-idf_component_register(SRCS "main.cpp"
-                            "udp_client.cpp"
-                            "expressions.cpp"
-                            "face_renderer.cpp"
-                            "servo_control.cpp"
-                            "ir_control.cpp"
-                            "led_control.cpp"
-                            "audio_pipeline.cpp"
-                    INCLUDE_DIRS "."
-                    REQUIRES nvs_flash esp_wifi esp_netif lwip rmt driver
+idf_component_register(
+    SRCS
+        main.cpp
+        udp_client.cpp
+        face_renderer.cpp
+        expressions.cpp
+        servo_control.cpp
+        ir_control.cpp
+        led_control.cpp
+        audio_pipeline.cpp
+    INCLUDE_DIRS
+        .
+    REQUIRES
+        driver
+        esp_wifi
+        esp_event
+        esp_netif
+        lwip
+        nvs_flash
+        mdns
+        freertos
+        esp_timer
+        spi_flash
+        newlib
+        fatfs
+        lovyangfx
 )

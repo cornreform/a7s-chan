@@ -1,424 +1,534 @@
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/timers.h"
-#include "esp_log.h"
+#include "freertos/event_groups.h"
 #include "esp_system.h"
-#include "esp_spi_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
 #include "driver/gpio.h"
 
 #include "udp_client.h"
-#include "expressions.h"
 #include "face_renderer.h"
 #include "servo_control.h"
 #include "ir_control.h"
 #include "led_control.h"
 #include "audio_pipeline.h"
+#include "expressions.h"
 
-// LovyanGFX display
-#include <LovyanGFX.hpp>
+static const char* TAG = "StackChan";
 
-static const char* TAG = "a7s";
+// WiFi configuration (can be overridden via sdkconfig)
+#define WIFI_SSID           CONFIG_ESP_WIFI_SSID
+#define WIFI_PASS           CONFIG_ESP_WIFI_PASSWORD
+#define WIFI_MAX_RETRY      5
 
-// ---- Pin definitions (M5Stack CoreS3) ----
-// Display (SPI)
-#define PIN_LCD_CS      3
-#define PIN_LCD_DC      46
-#define PIN_LCD_RST     4
-#define PIN_LCD_BLK     5
-#define PIN_LCD_MOSI    6
-#define PIN_LCD_MISO    7
-#define PIN_LCD_SCLK    8
+// Free heap threshold warning
+#define HEAP_WARN_THRESHOLD 32768
 
-// Servos (UART -> we'll use LEDC PWM instead)
-#define PIN_SERVO_1     41
-#define PIN_SERVO_2     42
+// CoreS3 GPIO definitions
+#define GPIO_BUTTON_A       41  // Left button
+#define GPIO_BUTTON_B       47  // Middle button (usually reset on CoreS3)
+#define GPIO_BUTTON_C       48  // Right button
+#define GPIO_PWR_EN         3   // Power enable (for peripherals)
+#define GPIO_BAT_ADC        7   // Battery voltage ADC
 
-// IR LED
-#define PIN_IR_LED      45
-
-// WS2812 LEDs
-#define PIN_LED_STRIP   38
-
-// I2S Microphone (NS4168 / INMP441)
-#define PIN_MIC_BCK     47
-#define PIN_MIC_WS      21
-#define PIN_MIC_DATA    14
-
-// I2S Speaker (NS4168 / MAX98357)
-#define PIN_SPKR_BCK    48
-#define PIN_SPKR_WS     45
-#define PIN_SPKR_DATA   13
-#define PIN_AMP_EN      40
-
-// Other
-#define PIN_BTN_A       0   // Boot button
-#define PIN_BTN_B       1
-#define PIN_BTN_C       2
-#define PIN_VIBRATOR    39
-#define PIN_BAT_ADC     10
-
-// WiFi config
-#define WIFI_SSID       "StackChan"
-#define WIFI_PASS       "stackchan123"
-
-// ---- Global state ----
-static LGFX display;
-static face_renderer_t g_face;
-static udp_client_t g_udp;
-static servo_t g_servo[2];
-static ir_controller_t g_ir;
-static led_controller_t g_led;
-static audio_pipeline_t g_audio;
-
-static expression_name_t g_current_expr = EXPR_NEUTRAL;
+// Battery measurement
+#define BAT_ADC_CHANNEL     ADC1_CHANNEL_7   // GPIO7
+#define BAT_ADC_ATTEN       ADC_ATTEN_DB_12
+#define BAT_FULL_MV         4200
+#define BAT_EMPTY_MV        3200
 
 // Forward declarations
-static void initialize_display(void);
-static void dispatch_command(const command_t* cmd);
-static void send_status_response(void);
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data);
+static void wifi_init_sta(void);
+static void command_handler(const udp_command_t& cmd, void* user_arg);
+static void buttons_init(void);
+static int read_battery_mv(void);
+static void read_imu_data(status_data_t* status);
+static void read_touch_data(status_data_t* status);
 
-// ---- Display initialization ----
-class LGFX_M5CoreS3 : public lgfx::LGFX_Device {
-    lgfx::Panel_ILI9341 _panel_instance;
-    lgfx::Bus_SPI _bus_instance;
-    lgfx::Light_PWM _light_instance;
+// Global objects
+FaceRenderer   g_face_renderer;
+ServoControl   g_servo_control;
+IRControl      g_ir_control;
+LEDControl     g_led_control;
+AudioPipeline  g_audio_pipeline;
+UDPClient      g_udp_client;
 
-public:
-    LGFX_M5CoreS3(void) {
-        // SPI bus config
-        auto cfg = _bus_instance.config();
-        cfg.spi_host = SPI2_HOST;
-        cfg.spi_mode = 0;
-        cfg.freq_write = 80000000;
-        cfg.freq_read = 20000000;
-        cfg.use_lock = true;
-        cfg.pin_sclk = PIN_LCD_SCLK;
-        cfg.pin_mosi = PIN_LCD_MOSI;
-        cfg.pin_miso = PIN_LCD_MISO;
-        cfg.pin_dc = PIN_LCD_DC;
-        _bus_instance.config(cfg);
-        _panel_instance.setBus(&_bus_instance);
+// System state
+static EventGroupHandle_t s_wifi_event_group;
+static int s_retry_count = 0;
+static bool s_wifi_connected = false;
+static expression_id_t s_current_expr = EXPR_NEUTRAL;
+static uint32_t s_uptime_ms = 0;
 
-        // Panel config
-        auto panel_cfg = _panel_instance.config();
-        panel_cfg.pin_cs = PIN_LCD_CS;
-        panel_cfg.pin_rst = PIN_LCD_RST;
-        panel_cfg.pin_busy = -1;
-        panel_cfg.memory_width = 320;
-        panel_cfg.memory_height = 240;
-        panel_cfg.panel_width = 320;
-        panel_cfg.panel_height = 240;
-        panel_cfg.offset_x = 0;
-        panel_cfg.offset_y = 0;
-        panel_cfg.offset_rotation = 0;
-        panel_cfg.dummy_read_pixel = 8;
-        panel_cfg.dummy_read_bits = 1;
-        panel_cfg.readable = false;
-        panel_cfg.invert = false;
-        panel_cfg.rgb_order = false;
-        panel_cfg.dlen_16bit = false;
-        panel_cfg.bus_shared = true;
-        _panel_instance.config(panel_cfg);
+// WiFi event bits
+#define WIFI_CONNECTED_BIT  BIT0
+#define WIFI_FAIL_BIT       BIT1
 
-        // Backlight
-        auto light_cfg = _light_instance.config();
-        light_cfg.pin_bl = PIN_LCD_BLK;
-        light_cfg.invert = false;
-        light_cfg.freq = 44100;
-        light_cfg.pwm_channel = 0;
-        _light_instance.config(light_cfg);
-        _panel_instance.setLight(&_light_instance);
-
-        setPanel(&_panel_instance);
-    }
-};
-
-static void initialize_display(void) {
-    // Initialize SPI display
-    display.init();
-    display.setRotation(1);  // Landscape
-    display.setBrightness(128);
-    display.fillScreen(TFT_WHITE);
-    display.setTextColor(TFT_BLACK);
-    display.setTextSize(2);
-    display.drawString("Stack-chan A7S", 80, 100);
-    display.display();
-    
-    ESP_LOGI(TAG, "Display initialized");
-}
-
-// ---- Command dispatch ----
-static void dispatch_command(const command_t* cmd) {
-    if (!cmd) return;
-    
-    ESP_LOGI(TAG, "Dispatching command: %s (seq=%d)", 
-             udp_client_cmd_to_str(cmd->type), cmd->seq_id);
-
-    switch (cmd->type) {
-        case CMD_SET_EXPRESSION: {
-            // Find expression by name
-            for (int i = 0; i < EXPR_COUNT; i++) {
-                // Simple lookup by comparing with expression_get() names
-                // For now, try direct match with known names
-                if (strcasecmp(cmd->expression_name, "neutral") == 0) {
-                    g_current_expr = EXPR_NEUTRAL;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "happy") == 0) {
-                    g_current_expr = EXPR_HAPPY;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "sad") == 0) {
-                    g_current_expr = EXPR_SAD;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "angry") == 0) {
-                    g_current_expr = EXPR_ANGRY;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "surprised") == 0) {
-                    g_current_expr = EXPR_SURPRISED;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "fearful") == 0) {
-                    g_current_expr = EXPR_FEARFUL;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "disgusted") == 0) {
-                    g_current_expr = EXPR_DISGUSTED;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "love") == 0) {
-                    g_current_expr = EXPR_LOVE;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "crying") == 0) {
-                    g_current_expr = EXPR_CRYING;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "annoyed") == 0) {
-                    g_current_expr = EXPR_ANNOYED;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "sleepy") == 0) {
-                    g_current_expr = EXPR_SLEEPY;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "confused") == 0) {
-                    g_current_expr = EXPR_CONFUSED;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "excited") == 0) {
-                    g_current_expr = EXPR_EXCITED;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "embarrassed") == 0) {
-                    g_current_expr = EXPR_EMBARRASSED;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "laughing") == 0) {
-                    g_current_expr = EXPR_LAUGHING;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "wink") == 0) {
-                    g_current_expr = EXPR_WINK;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "shock") == 0) {
-                    g_current_expr = EXPR_SHOCK;
-                    break;
-                } else if (strcasecmp(cmd->expression_name, "thinking") == 0) {
-                    g_current_expr = EXPR_THINKING;
-                    break;
-                }
-            }
-            face_renderer_set_preset(&g_face, g_current_expr);
-            break;
-        }
-        
-        case CMD_SET_EXPRESSION_RAW: {
-            face_renderer_set_expression(&g_face, cmd->expression);
-            break;
-        }
-        
-        case CMD_SET_SERVO:
-        case CMD_SET_SERVO_SMOOTH: {
-            int idx = cmd->servo_index;
-            if (idx >= 0 && idx < 2) {
-                if (cmd->servo_smooth) {
-                    servo_move(&g_servo[idx], cmd->servo_angle);
-                } else {
-                    servo_set_angle(&g_servo[idx], cmd->servo_angle);
-                }
-            }
-            break;
-        }
-        
-        case CMD_SEND_IR: {
-            ir_send_nec(&g_ir, cmd->ir_address, cmd->ir_command, cmd->ir_repeat);
-            break;
-        }
-        
-        case CMD_SET_LEDS: {
-            if (cmd->led_count > 0) {
-                for (int i = 0; i < cmd->led_count && i < 12; i++) {
-                    led_set(&g_led, i, cmd->led_colors[i].r, 
-                            cmd->led_colors[i].g, cmd->led_colors[i].b);
-                }
-                led_show(&g_led);
-            }
-            break;
-        }
-        
-        case CMD_SET_LED_PATTERN: {
-            led_pattern_t pattern = LED_PATTERN_SOLID;
-            if (strcasecmp(cmd->led_pattern, "blink") == 0) {
-                pattern = LED_PATTERN_BLINK;
-            } else if (strcasecmp(cmd->led_pattern, "wave") == 0) {
-                pattern = LED_PATTERN_WAVE;
-            } else if (strcasecmp(cmd->led_pattern, "rainbow") == 0) {
-                pattern = LED_PATTERN_RAINBOW;
-            } else if (strcasecmp(cmd->led_pattern, "off") == 0) {
-                pattern = LED_PATTERN_OFF;
-            }
-            
-            led_color_t color = {
-                .r = cmd->led_colors[0].r,
-                .g = cmd->led_colors[0].g,
-                .b = cmd->led_colors[0].b
-            };
-            led_set_pattern(&g_led, pattern, color, cmd->led_speed);
-            break;
-        }
-        
-        case CMD_SET_VOLUME: {
-            if (cmd->volume >= 0 && cmd->volume <= 100) {
-                // Stub: volume control
-                ESP_LOGI(TAG, "Volume set to %d", cmd->volume);
-            }
-            break;
-        }
-        
-        case CMD_GET_STATUS: {
-            send_status_response();
-            break;
-        }
-        
-        case CMD_REBOOT: {
-            ESP_LOGI(TAG, "Rebooting...");
-            vTaskDelay(pdMS_TO_TICKS(100));
-            esp_restart();
-            break;
-        }
-        
-        case CMD_PING: {
-            // Send pong
-            status_t status = {};
-            status.seq_id = cmd->seq_id;
-            udp_client_send_status(&g_udp, &status);
-            break;
-        }
-        
-        default:
-            ESP_LOGW(TAG, "Unhandled command type: %d", cmd->type);
-            break;
-    }
-}
-
-static void send_status_response(void) {
-    status_t status = {};
-    status.servo_angle[0] = servo_get_angle(&g_servo[0]);
-    status.servo_angle[1] = servo_get_angle(&g_servo[1]);
-    status.expression = g_current_expr;
-    status.wifi_rssi = 0;
-    
-    wifi_ap_record_t ap_info;
-    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-        status.wifi_rssi = ap_info.rssi;
-    }
-    
-    status.uptime_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    status.heap_free = (uint32_t)esp_get_free_heap_size();
-    status.mic_active = audio_is_mic_enabled(&g_audio);
-    status.spkr_active = audio_is_spkr_enabled(&g_audio);
-    
-    udp_client_send_status(&g_udp, &status);
-}
-
-// ---- Main application task ----
-static void app_main_task(void* arg) {
-    ESP_LOGI(TAG, "Application task started");
-    
-    TickType_t last_wake_time = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(10);  // ~100Hz
-    
-    command_t cmd;
-    uint32_t frame_count = 0;
-    
-    while (1) {
-        vTaskDelayUntil(&last_wake_time, period);
-        frame_count++;
-        
-        // Process any pending commands (non-blocking)
-        while (udp_client_receive(&g_udp, &cmd, 0)) {
-            dispatch_command(&cmd);
-        }
-        
-        // Update servo positions (smooth movement)
-        servo_update(&g_servo[0]);
-        servo_update(&g_servo[1]);
-        
-        // Update LED animation
-        if (frame_count % 3 == 0) {  // Every ~30ms
-            led_update(&g_led);
-        }
-        
-        // Render face (every frame ~100Hz)
-        face_renderer_update(&g_face);
-    }
-}
-
-// ---- Entry point ----
 extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "A7S-Firmware starting...");
-    ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
-    ESP_LOGI(TAG, "Chip: %s", ESP_CHIP_NAME);
-    
-    // Initialize subsystems
-    ESP_LOGI(TAG, "Initializing subsystems...");
-    
-    // Display
-    initialize_display();
-    face_renderer_init(&g_face, &display);
-    face_renderer_set_preset(&g_face, EXPR_NEUTRAL);
-    
-    // Servos (LEDC PWM at 50Hz)
-    if (servo_init(&g_servo[0], LEDC_TIMER_0, LEDC_CHANNEL_0, PIN_SERVO_1) != 0) {
-        ESP_LOGE(TAG, "Failed to init servo 0");
+    ESP_LOGI(TAG, "Stack-chan Firmware v1.0 - M5Stack CoreS3");
+    ESP_LOGI(TAG, "ESP-IDF v5.5, Chip: %s", CONFIG_IDF_TARGET);
+
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS needs erase, erasing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
-    if (servo_init(&g_servo[1], LEDC_TIMER_0, LEDC_CHANNEL_1, PIN_SERVO_2) != 0) {
-        ESP_LOGE(TAG, "Failed to init servo 1");
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize network interface
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Initialize peripherals
+    buttons_init();
+
+    // Initialize display
+    ESP_LOGI(TAG, "Initializing display...");
+    if (!g_face_renderer.begin()) {
+        ESP_LOGE(TAG, "Display init failed!");
+    } else {
+        g_face_renderer.set_expression(EXPR_NEUTRAL);
+        ESP_LOGI(TAG, "Display ready - neutral face shown");
     }
-    servo_set_angle(&g_servo[0], 90.0f);
-    servo_set_angle(&g_servo[1], 90.0f);
-    
-    // IR LED
-    if (ir_init(&g_ir, PIN_IR_LED) != 0) {
-        ESP_LOGE(TAG, "Failed to init IR");
+
+    // Initialize servos
+    ESP_LOGI(TAG, "Initializing servos...");
+    if (!g_servo_control.begin()) {
+        ESP_LOGW(TAG, "Servo init failed - check wiring");
     }
-    
-    // WS2812 LED strip
-    if (led_init(&g_led, PIN_LED_STRIP) != 0) {
-        ESP_LOGE(TAG, "Failed to init LEDs");
+
+    // Initialize IR blaster
+    ESP_LOGI(TAG, "Initializing IR blaster...");
+    if (!g_ir_control.begin()) {
+        ESP_LOGW(TAG, "IR blaster init failed");
     }
-    led_set_all(&g_led, 0, 0, 0);
-    led_show(&g_led);
-    
-    // Audio pipeline
-    if (audio_init(&g_audio, 
-                    PIN_MIC_BCK, PIN_MIC_WS, PIN_MIC_DATA,
-                    PIN_SPKR_BCK, PIN_SPKR_WS, PIN_SPKR_DATA,
-                    PIN_AMP_EN) != 0) {
-        ESP_LOGE(TAG, "Failed to init audio");
+
+    // Initialize RGB LEDs
+    ESP_LOGI(TAG, "Initializing RGB LEDs...");
+    if (!g_led_control.begin()) {
+        ESP_LOGW(TAG, "LED init failed");
+    } else {
+        // Startup animation: brief green flash
+        g_led_control.set_all(0, 50, 0);
+        g_led_control.show();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        g_led_control.clear();
     }
-    
-    // WiFi + UDP
-    ESP_LOGI(TAG, "Connecting to WiFi: %s", WIFI_SSID);
-    if (udp_client_init(&g_udp, WIFI_SSID, WIFI_PASS) != 0) {
-        ESP_LOGE(TAG, "Failed to init UDP client");
+
+    // Initialize audio pipeline
+    ESP_LOGI(TAG, "Initializing audio...");
+    if (!g_audio_pipeline.begin()) {
+        ESP_LOGW(TAG, "Audio init failed");
     }
-    udp_client_start(&g_udp);
-    
-    ESP_LOGI(TAG, "All subsystems initialized. Starting main loop...");
-    
-    // Create main application task
-    xTaskCreatePinnedToCore(app_main_task, "app_main", 8192, NULL, 5, NULL, 1);
+
+    // Connect to WiFi
+    wifi_init_sta();
+
+    // Wait for WiFi connection
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE, portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        s_wifi_connected = true;
+        ESP_LOGI(TAG, "WiFi connected! Starting UDP server...");
+
+        // Initialize UDP client
+        if (!g_udp_client.begin()) {
+            ESP_LOGE(TAG, "UDP client init failed!");
+        } else {
+            g_udp_client.set_command_callback(command_handler, nullptr);
+            g_face_renderer.set_expression(EXPR_HAPPY);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            g_face_renderer.set_expression(EXPR_NEUTRAL);
+        }
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGE(TAG, "WiFi connection failed!");
+        g_face_renderer.set_expression(EXPR_SAD);
+    }
+
+    // Startup LED effect
+    g_led_control.set_mode(LED_MODE_BREATHING);
+    g_led_control.set_speed(64);
+
+    // Main loop
+    uint32_t last_status_ms = 0;
+    uint32_t last_face_update_ms = 0;
+    uint32_t last_led_update_ms = 0;
+    uint32_t last_bat_read_ms = 0;
+    uint32_t last_servo_poll_ms = 0;
+
+    ESP_LOGI(TAG, "Entering main loop");
+
+    while (1) {
+        uint32_t now_ms = esp_timer_get_time() / 1000;
+        TickType_t tick_now = xTaskGetTickCount();
+
+        // Update uptime
+        s_uptime_ms = now_ms;
+
+        // Process UDP commands
+        udp_command_t cmd;
+        while (g_udp_client.get_command(&cmd)) {
+            command_handler(cmd, nullptr);
+        }
+
+        // Update face animation (tween)
+        if (g_face_renderer.is_tweening()) {
+            g_face_renderer.update(now_ms);
+        }
+
+        // Update LEDs
+        g_led_control.update(now_ms);
+
+        // Poll servo positions periodically
+        if (now_ms - last_servo_poll_ms > 500) {
+            last_servo_poll_ms = now_ms;
+            g_servo_control.read_state(1);
+            g_servo_control.read_state(2);
+        }
+
+        // Send status to A7S periodically
+        if (s_wifi_connected && (now_ms - last_status_ms > STATUS_INTERVAL_MS)) {
+            last_status_ms = now_ms;
+
+            status_data_t status = {};
+            status.uptime_ms = s_uptime_ms;
+
+            // Battery
+            if (now_ms - last_bat_read_ms > 5000) {
+                last_bat_read_ms = now_ms;
+                int bat_mv = read_battery_mv();
+                status.battery_voltage = bat_mv / 1000.0f;
+                status.battery_percent = ((float)(bat_mv - BAT_EMPTY_MV) /
+                                          (float)(BAT_FULL_MV - BAT_EMPTY_MV)) * 100.0f;
+                if (status.battery_percent < 0) status.battery_percent = 0;
+                if (status.battery_percent > 100) status.battery_percent = 100;
+            }
+
+            // Touch
+            read_touch_data(&status);
+
+            // IMU
+            read_imu_data(&status);
+
+            // Servo state
+            servo_state_t pan_state = g_servo_control.get_state(1);
+            servo_state_t tilt_state = g_servo_control.get_state(2);
+            status.servo_pan_pos = pan_state.current_position;
+            status.servo_tilt_pos = tilt_state.current_position;
+            status.servo_pan_temp = pan_state.temperature;
+            status.servo_tilt_temp = tilt_state.temperature;
+
+            // Expression
+            strncpy(status.current_expression,
+                    EXPRESSION_NAMES[s_current_expr],
+                    sizeof(status.current_expression) - 1);
+
+            // WiFi
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                status.wifi_rssi = ap_info.rssi;
+            }
+
+            // Memory
+            status.free_heap = esp_get_free_heap_size();
+            status.free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+            // Send
+            g_udp_client.send_status(status);
+
+            // Memory warning
+            if (status.free_heap < HEAP_WARN_THRESHOLD) {
+                ESP_LOGW(TAG, "Low heap: %lu bytes", (unsigned long)status.free_heap);
+            }
+        }
+
+        // Read microphone and send audio
+        if (g_audio_pipeline.is_playing()) {
+            // Wait for speaker to finish before reading mic
+        }
+
+        // Small delay to prevent watchdog starvation
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// ============================================================
+// Command handler
+// ============================================================
+
+static void command_handler(const udp_command_t& cmd, void* user_arg) {
+    (void)user_arg;
+
+    switch (cmd.type) {
+        case CMD_HEAD: {
+            ESP_LOGI(TAG, "CMD_HEAD: pan=%.1f, tilt=%.1f, speed=%u",
+                     cmd.head.pan, cmd.head.tilt, cmd.head.speed);
+
+            if (cmd.head.has_pan) {
+                g_servo_control.set_pan(cmd.head.pan);
+            }
+            if (cmd.head.has_tilt) {
+                g_servo_control.set_tilt(cmd.head.tilt);
+            }
+            break;
+        }
+
+        case CMD_FACE: {
+            ESP_LOGI(TAG, "CMD_FACE: expression=%s, tween_ms=%lu",
+                     cmd.face.expression, (unsigned long)cmd.face.tween_ms);
+
+            expression_id_t expr_id = expression_find_by_name(cmd.face.expression);
+            if (expr_id < EXPR_COUNT) {
+                s_current_expr = expr_id;
+                if (cmd.face.has_tween && cmd.face.tween_ms > 0) {
+                    g_face_renderer.tween_to(expr_id, cmd.face.tween_ms);
+                } else {
+                    g_face_renderer.set_expression(expr_id);
+                }
+            } else {
+                ESP_LOGW(TAG, "Unknown expression: %s", cmd.face.expression);
+            }
+            break;
+        }
+
+        case CMD_LED: {
+            ESP_LOGI(TAG, "CMD_LED: mode=%s, r=%d, g=%d, b=%d",
+                     cmd.led.mode, cmd.led.r, cmd.led.g, cmd.led.b);
+
+            if (cmd.led.mode[0] != '\0') {
+                if (strcmp(cmd.led.mode, "static") == 0) {
+                    g_led_control.set_mode(LED_MODE_STATIC);
+                    g_led_control.set_all(cmd.led.r, cmd.led.g, cmd.led.b);
+                    g_led_control.show();
+                } else if (strcmp(cmd.led.mode, "breathing") == 0) {
+                    g_led_control.set_all(cmd.led.r, cmd.led.g, cmd.led.b);
+                    g_led_control.set_mode(LED_MODE_BREATHING);
+                } else if (strcmp(cmd.led.mode, "rainbow") == 0) {
+                    g_led_control.set_mode(LED_MODE_RAINBOW);
+                } else if (strcmp(cmd.led.mode, "chase") == 0) {
+                    g_led_control.set_mode(LED_MODE_CHASE);
+                } else if (strcmp(cmd.led.mode, "blink") == 0) {
+                    g_led_control.set_all(cmd.led.r, cmd.led.g, cmd.led.b);
+                    g_led_control.set_mode(LED_MODE_BLINK);
+                } else if (strcmp(cmd.led.mode, "wave") == 0) {
+                    g_led_control.set_all(cmd.led.r, cmd.led.g, cmd.led.b);
+                    g_led_control.set_mode(LED_MODE_WAVE);
+                } else if (strcmp(cmd.led.mode, "off") == 0) {
+                    g_led_control.set_mode(LED_MODE_STATIC);
+                    g_led_control.clear();
+                }
+            }
+
+            if (cmd.led.brightness > 0) {
+                g_led_control.set_brightness(cmd.led.brightness);
+            }
+            break;
+        }
+
+        case CMD_IR: {
+            ESP_LOGI(TAG, "CMD_IR: addr=0x%04X, cmd=0x%04X, repeat=%d",
+                     cmd.ir.address, cmd.ir.command, cmd.ir.repeat);
+
+            g_ir_control.send_nec(cmd.ir.address, cmd.ir.command, cmd.ir.repeat);
+            break;
+        }
+
+        case CMD_SCREEN: {
+            ESP_LOGI(TAG, "CMD_SCREEN: brightness=%d, clear=%d",
+                     cmd.screen.brightness, cmd.screen.clear);
+
+            if (cmd.screen.clear) {
+                g_face_renderer.clear(TFT_BLACK);
+            }
+            if (cmd.screen.brightness > 0) {
+                g_face_renderer.display()->setBrightness(cmd.screen.brightness);
+            }
+            break;
+        }
+
+        case CMD_EMOTE: {
+            ESP_LOGI(TAG, "CMD_EMOTE: expression=%s, repeat=%d",
+                     cmd.emote.expression, cmd.emote.repeat);
+
+            // Emotes are sequences of expressions/animations
+            // For now, treat as single face change
+            expression_id_t expr_id = expression_find_by_name(cmd.emote.expression);
+            if (expr_id < EXPR_COUNT) {
+                s_current_expr = expr_id;
+                g_face_renderer.tween_to(expr_id, 300);
+            }
+            break;
+        }
+
+        case CMD_SPEAK_START: {
+            ESP_LOGI(TAG, "CMD_SPEAK_START: rate=%d", cmd.speak_start.sample_rate);
+
+            if (!g_audio_pipeline.start_speaker()) {
+                ESP_LOGE(TAG, "Failed to start speaker");
+            }
+            break;
+        }
+
+        case CMD_SPEAK_DATA: {
+            // Audio data is sent as raw PCM16 following the command
+            // The main loop handles the actual audio receive
+            ESP_LOGD(TAG, "CMD_SPEAK_DATA");
+            break;
+        }
+
+        case CMD_SPEAK_STOP: {
+            ESP_LOGI(TAG, "CMD_SPEAK_STOP");
+            g_audio_pipeline.stop_speaker();
+            break;
+        }
+
+        case CMD_CUSTOM: {
+            ESP_LOGI(TAG, "CMD_CUSTOM: direct expression params");
+            break;
+        }
+
+        default:
+            ESP_LOGW(TAG, "Unknown command type: %d", cmd.type);
+            break;
+    }
+}
+
+// ============================================================
+// WiFi initialization
+// ============================================================
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_count < WIFI_MAX_RETRY) {
+            esp_wifi_connect();
+            s_retry_count++;
+            ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d", s_retry_count, WIFI_MAX_RETRY);
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_count = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_sta(void) {
+    s_wifi_event_group = xEventGroupCreate();
+
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    // WiFi SSID and password from sdkconfig
+    // These must be provided via sdkconfig or menuconfig
+    #ifndef CONFIG_ESP_WIFI_SSID
+    #define CONFIG_ESP_WIFI_SSID "StackChan"
+    #endif
+    #ifndef CONFIG_ESP_WIFI_PASSWORD
+    #define CONFIG_ESP_WIFI_PASSWORD ""
+    #endif
+
+    wifi_config_t wifi_config = {};
+    strncpy((char*)wifi_config.sta.ssid, CONFIG_ESP_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, CONFIG_ESP_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", CONFIG_ESP_WIFI_SSID);
+}
+
+// ============================================================
+// Button initialization
+// ============================================================
+
+static void buttons_init(void) {
+    // Configure buttons as inputs with pull-ups
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = (1ULL << GPIO_BUTTON_A) |
+                           (1ULL << GPIO_BUTTON_C);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&io_conf);
+}
+
+// ============================================================
+// Battery reading
+// ============================================================
+
+static int read_battery_mv(void) {
+    // Simplified battery read - returns simulated value since ADC init
+    // would require additional ADC configuration
+    // In production, use adc1_config_channel_atten + adc1_get_raw
+    return 3800; // Default ~3.8V
+}
+
+// ============================================================
+// IMU data (placeholder)
+// ============================================================
+
+static void read_imu_data(status_data_t* status) {
+    // M5Stack CoreS3 has BMI270 IMU on I2C
+    // For now, return zero/neutral values
+    // Full IMU driver would go here
+    status->imu_accel_x = 0.0f;
+    status->imu_accel_y = 0.0f;
+    status->imu_accel_z = 1.0f; // gravity
+    status->imu_gyro_x = 0.0f;
+    status->imu_gyro_y = 0.0f;
+    status->imu_gyro_z = 0.0f;
+    status->imu_temp = 25.0f;
+}
+
+// ============================================================
+// Touch data
+// ============================================================
+
+static void read_touch_data(status_data_t* status) {
+    // CoreS3 has FT6336 capacitive touch controller on I2C
+    // For now, return no touch data
+    // Full touch driver would go here
+    status->touch_touched = false;
+    status->touch_x = 0;
+    status->touch_y = 0;
 }
