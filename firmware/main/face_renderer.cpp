@@ -16,13 +16,14 @@ FaceRenderer::FaceRenderer()
     , m_panel(nullptr)
     , m_cx(LCD_WIDTH/2)
     , m_cy(LCD_HEIGHT/2)
-    , m_skin_color(0xFFDC)
 {
     const expression_params_t* n = get_expression_params(EXPR_IDLE);
     m_current_params = *n; m_target_params = *n;
 }
 
-FaceRenderer::~FaceRenderer() {}
+FaceRenderer::~FaceRenderer() {
+    if (m_panel) esp_lcd_panel_del(m_panel);
+}
 
 bool FaceRenderer::begin() {
     // Init display via BSP (handles PWR_EN, AW9523, GPIO35, SPI, ILI9342 init)
@@ -120,14 +121,13 @@ void FaceRenderer::draw_face_outline(int fy) {
     for (int x = 0; x < LCD_WIDTH; x++) {
         int fx = x - m_cx;
         float rx = fx/85.0f, ry = fy/95.0f;
-        if (rx*rx + ry*ry <= 1.0f) m_line_buf[x] = m_skin_color;
+        if (rx*rx + ry*ry <= 1.0f) m_line_buf[x] = 0xFFDC;
     }
 }
 
 void FaceRenderer::draw_eye_line(int fy, int cx, int cy, const expression_params_t& p, bool is_left) {
     if (p.heart_eyes > 0.5f) { draw_heart_eyes_line(fy, cx, cy, p, is_left); return; }
     int ew = 18, eh = (int)(12 * p.eye_height * p.eye_open);
-    if (eh < 2) {
         if (fy-cy == 0) for (int x = -ew; x <= ew; x++) {
             int px = m_cx+cx+x; if (px>=0&&px<LCD_WIDTH) m_line_buf[px]=0x0000;
         }
