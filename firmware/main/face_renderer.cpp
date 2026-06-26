@@ -21,9 +21,7 @@ bool FaceRenderer::begin() {
     esp_err_t err = bsp_display_new(&cfg, &m_panel, &io);
     if (err != ESP_OK) { ESP_LOGE(TAG, "bsp_display_new failed: %d", err); return false; }
     
-    // Force backlight on via direct GPIO + BSP
-    gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_38, 1);
+    // Backlight already set in app_main() - just call BSP backlight too
     bsp_display_backlight_on();
     esp_lcd_panel_disp_on_off(m_panel, true);
     ESP_LOGI(TAG, "Display ready via BSP");
