@@ -19,7 +19,8 @@ bool FaceRenderer::begin() {
     const bsp_display_config_t cfg = { .max_transfer_sz = LCD_WIDTH * 80 * 2 };
     esp_lcd_panel_io_handle_t io = NULL;
     ESP_ERROR_CHECK(bsp_display_new(&cfg, &m_panel, &io));
-    bsp_display_backlight_on();  // CRITICAL: enable backlight!
+    bsp_display_backlight_on();
+    esp_lcd_panel_disp_on_off(m_panel, true);  // Enable display output
     ESP_LOGI(TAG, "Display ready via BSP");
     // Flash test
     uint16_t c = 0xF800;
