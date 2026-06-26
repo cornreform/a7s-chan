@@ -2,18 +2,13 @@
 
 #include <cstdint>
 #include "expressions.h"
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
 #include "esp_timer.h"
 
 // M5Stack CoreS3 LCD pins
-#define CORE3_LCD_CS    GPIO_NUM_5
-#define CORE3_LCD_MOSI  GPIO_NUM_6
-#define CORE3_LCD_SCK   GPIO_NUM_7
-#define CORE3_LCD_DC    GPIO_NUM_35  // Shared with SPI MISO!
-#define CORE3_LCD_RST   GPIO_NUM_9
-#define CORE3_LCD_BL    GPIO_NUM_38
-
 #define LCD_WIDTH  320
 #define LCD_HEIGHT 240
 
@@ -44,9 +39,13 @@ private:
     uint32_t m_last_blink;
     bool m_eye_state;
 
-    // Line buffer (640 bytes per line, DMA-safe)
+    esp_lcd_panel_io_handle_t m_io_handle;
+    esp_lcd_panel_handle_t m_panel_handle;
+
+    // Line buffer
     uint16_t m_line_buf[LCD_WIDTH];
 
+    void draw_face_outline(int y);
     void draw_eye_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
     void draw_pupil(int px, int py, int cx, int cy, const expression_params_t& p, bool is_left, int line_y);
     void draw_eyebrow_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
@@ -54,21 +53,7 @@ private:
     void draw_blush_line(int line_y, int cx, int cy, const expression_params_t& p);
     void draw_tears_line(int line_y, int cx, int cy, const expression_params_t& p);
     void draw_heart_eyes_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
-    void draw_face_outline(int y);
 
-    // Low-level LCD
-    void lcd_init();
-    void lcd_write_cmd(uint8_t cmd);
-    void lcd_write_data(const uint8_t* data, size_t len);
-    void lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
-    void send_line(int y);
-
-    // SPI handle
-    spi_device_handle_t m_spi;
-
-    // Face center
     int m_cx, m_cy;
-
-    // Skin tone
     uint16_t m_skin_color;
 };
