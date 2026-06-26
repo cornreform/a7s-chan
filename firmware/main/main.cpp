@@ -70,7 +70,7 @@ UDPClient      g_udp_client;
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_count = 0;
 static bool s_wifi_connected = false;
-static expression_id_t s_current_expr = EXPR_NEUTRAL;
+static expression_id_t s_current_expr = EXPR_IDLE;
 static uint32_t s_uptime_ms = 0;
 
 // WiFi event bits
@@ -102,8 +102,8 @@ extern "C" void app_main(void) {
     if (!g_face_renderer.begin()) {
         ESP_LOGE(TAG, "Display init failed!");
     } else {
-        g_face_renderer.set_expression(EXPR_NEUTRAL);
-        ESP_LOGI(TAG, "Display ready - neutral face shown");
+        g_face_renderer.set_expression(EXPR_IDLE);
+        ESP_LOGI(TAG, "Display ready - idle face shown");
     }
 
     // Initialize servos
@@ -155,7 +155,7 @@ extern "C" void app_main(void) {
             g_udp_client.set_command_callback(command_handler, nullptr);
             g_face_renderer.set_expression(EXPR_HAPPY);
             vTaskDelay(pdMS_TO_TICKS(500));
-            g_face_renderer.set_expression(EXPR_NEUTRAL);
+            g_face_renderer.set_expression(EXPR_IDLE);
         }
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGE(TAG, "WiFi connection failed!");
@@ -237,7 +237,7 @@ extern "C" void app_main(void) {
 
             // Expression
             strncpy(status.current_expression,
-                    EXPRESSION_NAMES[s_current_expr],
+                    get_expression_name(s_current_expr),
                     sizeof(status.current_expression) - 1);
 
             // WiFi
@@ -294,7 +294,7 @@ static void command_handler(const udp_command_t& cmd, void* user_arg) {
             ESP_LOGI(TAG, "CMD_FACE: expression=%s, tween_ms=%lu",
                      cmd.face.expression, (unsigned long)cmd.face.tween_ms);
 
-            expression_id_t expr_id = expression_find_by_name(cmd.face.expression);
+            expression_id_t expr_id = lookup_expression(cmd.face.expression);
             if (expr_id < EXPR_COUNT) {
                 s_current_expr = expr_id;
                 if (cmd.face.has_tween && cmd.face.tween_ms > 0) {
@@ -369,7 +369,7 @@ static void command_handler(const udp_command_t& cmd, void* user_arg) {
 
             // Emotes are sequences of expressions/animations
             // For now, treat as single face change
-            expression_id_t expr_id = expression_find_by_name(cmd.emote.expression);
+            expression_id_t expr_id = lookup_expression(cmd.emote.expression);
             if (expr_id < EXPR_COUNT) {
                 s_current_expr = expr_id;
                 g_face_renderer.tween_to(expr_id, 300);

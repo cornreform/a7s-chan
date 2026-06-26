@@ -144,8 +144,8 @@ void IRControl::send_nec(uint16_t address, uint16_t command, int repeat) {
 void IRControl::send_symbols(rmt_symbol_word_t* symbols, size_t count, int repeat) {
     if (!m_initialized || !m_tx_channel) return;
 
-    rmt_tx_config_t tx_config = {
-        .loop_count = repeat - 1,
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,
         .flags = {
             .eot_level = 0,
         },

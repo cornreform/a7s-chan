@@ -102,7 +102,6 @@ bool AudioPipeline::init_mic() {
             .ws_width = I2S_SLOT_BIT_WIDTH_16BIT,
             .ws_pol = false,
             .bit_shift = true,
-            .msb_right = true,
         },
         .gpio_cfg = {
             .bclk = (gpio_num_t)I2S_MIC_BCLK,
@@ -116,38 +115,13 @@ bool AudioPipeline::init_mic() {
         },
     };
 
-    // For PDM mic, use PDM RX config instead
-    i2s_pdm_rx_config_t pdm_rx_config = {
-        .clk_cfg = {
-            .sample_rate_hz = AUDIO_SAMPLE_RATE,
-            .clk_src = I2S_CLK_SRC_DEFAULT,
-        },
-        .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
-            .slot_mode = I2S_SLOT_MODE_MONO,
-            .slot_mask = I2S_PDM_SLOT_LEFT,
-        },
-        .gpio_cfg = {
-            .clk = (gpio_num_t)I2S_MIC_BCLK,
-            .din = (gpio_num_t)I2S_MIC_DIN,
-            .invert_flags = {
-                .clk_inv = false,
-            },
-        },
-    };
-
-    // Try PDM first, fall back to standard I2S
-    err = i2s_channel_init_pdm_rx_mode(m_mic_handle, &pdm_rx_config);
+    // Use standard I2S mode for the microphone
+    err = i2s_channel_init_std_mode(m_mic_handle, &std_config);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "PDM RX init failed, trying standard I2S: %d", err);
-        err = i2s_channel_init_std_mode(m_mic_handle, &std_config);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Standard I2S init failed: %d", err);
-            i2s_del_channel(m_mic_handle);
-            m_mic_handle = nullptr;
-            return false;
-        }
+        ESP_LOGE(TAG, "Standard I2S init failed: %d", err);
+        i2s_del_channel(m_mic_handle);
+        m_mic_handle = nullptr;
+        return false;
     }
 
     return true;
@@ -183,7 +157,6 @@ bool AudioPipeline::init_speaker() {
             .ws_width = I2S_SLOT_BIT_WIDTH_16BIT,
             .ws_pol = false,
             .bit_shift = true,
-            .msb_right = true,
         },
         .gpio_cfg = {
             .bclk = (gpio_num_t)I2S_SPK_BCLK,

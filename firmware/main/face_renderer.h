@@ -76,9 +76,8 @@ private:
     void draw_mouth(int cx, int cy, const expression_params_t& p);
     void draw_blush(int cx, int cy, const expression_params_t& p);
     void draw_pupil(int cx, int cy, const expression_params_t& p, bool is_left);
-    void draw_tear(int cx, int cy, const expression_params_t& p);
-    void draw_sweatdrop(int cx, int cy, const expression_params_t& p);
-    void draw_sparkle(int cx, int cy, const expression_params_t& p);
+    void draw_tears(int cx, int cy, const expression_params_t& p);
+    void draw_heart_eyes(int cx, int cy, const expression_params_t& p, bool is_left);
 
     // Color helpers
     uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) const;
