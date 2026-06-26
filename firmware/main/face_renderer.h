@@ -28,10 +28,7 @@ public:
     void tween_to(expression_id_t target_id, uint32_t duration_ms);
     void update(uint32_t current_time_ms);
     void render();
-
-    // Drawing helpers
     void clear(uint16_t color = 0x0000);
-    void draw_face_frame();
 
     expression_id_t current_expression() const { return m_current_id; }
     bool is_tweening() const { return m_tweening; }
@@ -47,25 +44,31 @@ private:
     uint32_t m_last_blink;
     bool m_eye_state;
 
-    // LCD framebuffer (for double-buffering)
-    uint16_t* m_fb;
+    // Line buffer (640 bytes per line, DMA-safe)
+    uint16_t m_line_buf[LCD_WIDTH];
 
-    void draw_eye(int cx, int cy, const expression_params_t& p, bool is_left);
-    void draw_pupil(int cx, int cy, const expression_params_t& p, bool is_left);
-    void draw_eyebrow(int cx, int cy, const expression_params_t& p, bool is_left);
-    void draw_mouth(int cx, int cy, const expression_params_t& p);
-    void draw_blush(int cx, int cy, const expression_params_t& p);
-    void draw_tears(int cx, int cy, const expression_params_t& p);
-    void draw_heart_eyes(int cx, int cy, const expression_params_t& p, bool is_left);
+    void draw_eye_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
+    void draw_pupil(int px, int py, int cx, int cy, const expression_params_t& p, bool is_left, int line_y);
+    void draw_eyebrow_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
+    void draw_mouth_line(int line_y, int cx, int cy, const expression_params_t& p);
+    void draw_blush_line(int line_y, int cx, int cy, const expression_params_t& p);
+    void draw_tears_line(int line_y, int cx, int cy, const expression_params_t& p);
+    void draw_heart_eyes_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
+    void draw_face_outline(int y);
 
     // Low-level LCD
     void lcd_init();
     void lcd_write_cmd(uint8_t cmd);
     void lcd_write_data(const uint8_t* data, size_t len);
     void lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
-    void lcd_flush();
-    void draw_pixel(uint16_t x, uint16_t y, uint16_t color);
+    void send_line(int y);
 
     // SPI handle
     spi_device_handle_t m_spi;
+
+    // Face center
+    int m_cx, m_cy;
+
+    // Skin tone
+    uint16_t m_skin_color;
 };
