@@ -1,6 +1,7 @@
 #include "face_renderer.h"
 #include "esp_log.h"
 #include "bsp/m5stack_core_s3.h"
+#include "bsp/display.h"
 #include "esp_lcd_panel_ops.h"
 static const char* TAG = "FaceRenderer";
 
@@ -18,6 +19,7 @@ bool FaceRenderer::begin() {
     const bsp_display_config_t cfg = { .max_transfer_sz = LCD_WIDTH * 80 * 2 };
     esp_lcd_panel_io_handle_t io = NULL;
     ESP_ERROR_CHECK(bsp_display_new(&cfg, &m_panel, &io));
+    bsp_display_backlight_on();  // CRITICAL: enable backlight!
     ESP_LOGI(TAG, "Display ready via BSP");
     // Flash test
     uint16_t c = 0xF800;
