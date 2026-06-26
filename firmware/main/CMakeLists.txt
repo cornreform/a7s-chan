@@ -10,7 +10,6 @@ idf_component_register(
         audio_pipeline.cpp
     INCLUDE_DIRS
         .
-        ${CMAKE_CURRENT_LIST_DIR}/../components/lovyangfx/LovyanGFX/src
     REQUIRES
         driver
         esp_wifi
