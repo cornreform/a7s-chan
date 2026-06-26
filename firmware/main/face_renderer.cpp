@@ -128,6 +128,7 @@ void FaceRenderer::draw_face_outline(int fy) {
 void FaceRenderer::draw_eye_line(int fy, int cx, int cy, const expression_params_t& p, bool is_left) {
     if (p.heart_eyes > 0.5f) { draw_heart_eyes_line(fy, cx, cy, p, is_left); return; }
     int ew = 18, eh = (int)(12 * p.eye_height * p.eye_open);
+    if (eh < 2) {
         if (fy-cy == 0) for (int x = -ew; x <= ew; x++) {
             int px = m_cx+cx+x; if (px>=0&&px<LCD_WIDTH) m_line_buf[px]=0x0000;
         }
