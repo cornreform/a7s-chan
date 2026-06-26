@@ -1,8 +1,6 @@
 #include "ir_control.h"
-#include <cstring>
+#include "esp_check.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 static const char* TAG = "IRControl";
 
@@ -12,32 +10,24 @@ IRControl::IRControl()
     , m_initialized(false)
     , m_tx_gpio(45)
     , m_carrier_freq(NEC_CARRIER_FREQ_HZ)
-{
-}
+{}
 
 IRControl::~IRControl() {
     stop();
-    if (m_tx_channel) {
-        rmt_del_channel(m_tx_channel);
-    }
 }
 
-bool IRControl::begin(int tx_gpio, rmt_channel_t channel) {
+bool IRControl::begin(int tx_gpio) {
+    if (m_initialized) return true;
+
     m_tx_gpio = tx_gpio;
 
-    // RMT TX channel config
+    // Create RMT TX channel
     rmt_tx_channel_config_t tx_chan_config = {
-        .gpio_num = static_cast<gpio_num_t>(m_tx_gpio),
+        .gpio_num = (gpio_num_t)m_tx_gpio,
         .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 1000000, // 1 MHz, 1 us resolution
+        .resolution_hz = 1000000, // 1us resolution
         .mem_block_symbols = 64,
         .trans_queue_depth = 4,
-        .flags = {
-            .invert_out = false,
-            .with_dma = false,
-            .io_loop_back = false,
-            .io_od_mode = false,
-        }
     };
 
     esp_err_t err = rmt_new_tx_channel(&tx_chan_config, &m_tx_channel);
@@ -46,219 +36,189 @@ bool IRControl::begin(int tx_gpio, rmt_channel_t channel) {
         return false;
     }
 
-    // Carrier modulation for IR (38kHz)
-    rmt_carrier_config_t carrier_config = {
-        .carrier_en = true,
-        .carrier_level = 1, // active high
-        .carrier_duty_percent = 50,
-        .carrier_freq_hz = m_carrier_freq,
-    };
+    // Create a copy encoder
+    rmt_copy_encoder_config_t encoder_config = {};
+    err = rmt_new_copy_encoder(&encoder_config, &m_encoder);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create RMT encoder: %d", err);
+        rmt_del_channel(m_tx_channel);
+        m_tx_channel = nullptr;
+        return false;
+    }
 
+    // Apply carrier
+    rmt_carrier_config_t carrier_config = {
+        .frequency_hz = m_carrier_freq,
+        .duty_cycle = 0.5,
+    };
     err = rmt_apply_carrier(m_tx_channel, &carrier_config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to apply carrier: %d", err);
-        rmt_del_channel(m_tx_channel);
-        m_tx_channel = nullptr;
-        return false;
+        ESP_LOGW(TAG, "Carrier config failed: %d", err);
     }
 
-    // Create a copy encoder for raw symbols
-    rmt_copy_encoder_config_t copy_encoder_config = {};
-    err = rmt_new_copy_encoder(&copy_encoder_config, &m_encoder);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create copy encoder: %d", err);
-        rmt_del_channel(m_tx_channel);
-        m_tx_channel = nullptr;
-        return false;
-    }
-
-    // Enable the TX channel
     err = rmt_enable(m_tx_channel);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable TX channel: %d", err);
+        ESP_LOGE(TAG, "Failed to enable RMT channel: %d", err);
+        rmt_del_channel(m_tx_channel);
+        m_tx_channel = nullptr;
         return false;
     }
 
     m_initialized = true;
-    ESP_LOGI(TAG, "IR blaster initialized on GPIO %d", m_tx_gpio);
     return true;
 }
 
 void IRControl::send_nec(uint16_t address, uint16_t command, int repeat) {
     if (!m_initialized) return;
 
-    // Build NEC frame symbols
-    // NEC frame: header + 8 address bits + 8 ~address bits + 8 command bits + 8 ~command bits
-    // We encode as a sequence of RMT symbol words
-    size_t symbol_count = 1 + 32 + 1; // header + 32 bits + stop bit
-    size_t repeat_count = repeat;
-    size_t total_symbols = symbol_count + (repeat_count * (1 + 32 + 1 + 1)); // +repeat gap per repeat
+    // NEC frame: address (low byte + high byte inverted) + command (low byte + high byte inverted)
+    uint16_t addr_inv = ~address;
+    uint16_t cmd_inv = ~command;
 
-    rmt_symbol_word_t* symbols = (rmt_symbol_word_t*)heap_caps_malloc(
-        total_symbols * sizeof(rmt_symbol_word_t), MALLOC_CAP_8BIT
-    );
-    if (!symbols) {
-        ESP_LOGE(TAG, "Failed to allocate symbol buffer");
-        return;
+    // Total symbols: header + 32 data bits + stop bit (each = 2 symbols: high+low)
+    // For repeat frames, we need header + stop
+    size_t total_symbols = 2 + 32 * 2 + 2; // header + data + stop
+    if (repeat > 0) {
+        total_symbols += repeat * (2 + 2); // repeat gap + repeat header + stop
     }
+
+    rmt_symbol_word_t* symbols = (rmt_symbol_word_t*)calloc(total_symbols, sizeof(rmt_symbol_word_t));
+    if (!symbols) return;
 
     size_t idx = 0;
 
-    // First frame
-    build_nec_symbols(symbols, address, command, &idx);
+    // Header
+    symbols[idx++] = (rmt_symbol_word_t){
+        .duration0 = NEC_HEADER_HIGH,
+        .level0 = 1,
+        .duration1 = NEC_HEADER_LOW,
+        .level1 = 0,
+    };
+
+    // Data bits (LSB first)
+    uint32_t frame = (cmd_inv << 24) | (command << 16) | (addr_inv << 8) | address;
+    for (int i = 0; i < 32; i++) {
+        if (frame & 0x01) {
+            symbols[idx++] = (rmt_symbol_word_t){
+                .duration0 = NEC_BIT1_HIGH, .level0 = 1,
+                .duration1 = NEC_BIT1_LOW, .level1 = 0,
+            };
+        } else {
+            symbols[idx++] = (rmt_symbol_word_t){
+                .duration0 = NEC_BIT0_HIGH, .level0 = 1,
+                .duration1 = NEC_BIT0_LOW, .level1 = 0,
+            };
+        }
+        frame >>= 1;
+    }
+
+    // Stop bit
+    symbols[idx++] = (rmt_symbol_word_t){
+        .duration0 = NEC_BIT0_HIGH, .level0 = 1,
+        .duration1 = 0, .level1 = 0,
+    };
 
     // Repeat frames
     for (int r = 0; r < repeat; r++) {
         // Repeat gap
-        symbols[idx].duration0 = 40; // 40ms gap
-        symbols[idx].level0 = 0;
-        symbols[idx].duration1 = 0;
-        symbols[idx].level1 = 0;
-        idx++;
-
-        build_nec_symbols(symbols + idx, address, command, &idx);
+        symbols[idx++] = (rmt_symbol_word_t){
+            .duration0 = NEC_REPEAT_GAP, .level0 = 0,
+            .duration1 = 0, .level1 = 0,
+        };
+        // Repeat header
+        symbols[idx++] = (rmt_symbol_word_t){
+            .duration0 = NEC_REPEAT_HIGH, .level0 = 1,
+            .duration1 = NEC_REPEAT_LOW, .level1 = 0,
+        };
+        // Stop bit
+        symbols[idx++] = (rmt_symbol_word_t){
+            .duration0 = NEC_BIT0_HIGH, .level0 = 1,
+            .duration1 = 0, .level1 = 0,
+        };
     }
 
-    // Transmit
+    send_symbols(symbols, idx, 1);
+    free(symbols);
+}
+
+void IRControl::send_symbols(rmt_symbol_word_t* symbols, size_t count, int repeat) {
+    if (!m_initialized || !m_tx_channel) return;
+
     rmt_tx_config_t tx_config = {
-        .loop_count = 0, // one-shot
+        .loop_count = repeat - 1,
         .flags = {
-            .stop_at_end = true
-        }
+            .eot_level = 0,
+        },
     };
 
-    esp_err_t err = rmt_transmit(m_tx_channel, m_encoder, symbols,
-                                  idx * sizeof(rmt_symbol_word_t), &tx_config);
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "RMT transmit failed: %d", err);
+    for (int i = 0; i < (repeat > 0 ? repeat : 1); i++) {
+        esp_err_t err = rmt_transmit(m_tx_channel, m_encoder, symbols,
+                                      count * sizeof(rmt_symbol_word_t), &tx_config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "RMT transmit failed: %d", err);
+            break;
+        }
     }
 
     // Wait for transmission to complete
-    rmt_tx_wait_all_done(m_tx_channel, pdMS_TO_TICKS(1000));
-
-    heap_caps_free(symbols);
+    rmt_tx_wait_all_done(m_tx_channel, 1000);
 }
 
 void IRControl::send_raw(const uint8_t* data, size_t len) {
-    // Send raw encoded symbol data
     if (!m_initialized || !data || len == 0) return;
 
-    size_t symbol_count = len / sizeof(rmt_symbol_word_t);
-    const rmt_symbol_word_t* symbols = reinterpret_cast<const rmt_symbol_word_t*>(data);
+    size_t symbol_count = len / 2; // 2 bytes per symbol (duration+level repeated)
+    rmt_symbol_word_t* symbols = (rmt_symbol_word_t*)calloc(symbol_count, sizeof(rmt_symbol_word_t));
+    if (!symbols) return;
 
-    rmt_tx_config_t tx_config = {
-        .loop_count = 0,
-        .flags = { .stop_at_end = true }
-    };
+    for (size_t i = 0; i < symbol_count; i++) {
+        symbols[i].duration0 = data[i * 2];
+        symbols[i].level0 = data[i * 2 + 1] & 0x01;
+        symbols[i].duration1 = 0;
+        symbols[i].level1 = 0;
+    }
 
-    rmt_transmit(m_tx_channel, m_encoder, symbols,
-                  symbol_count * sizeof(rmt_symbol_word_t), &tx_config);
-    rmt_tx_wait_all_done(m_tx_channel, pdMS_TO_TICKS(1000));
+    send_symbols(symbols, symbol_count, 1);
+    free(symbols);
 }
 
 void IRControl::send_learned(const uint32_t* timings, size_t count) {
     if (!m_initialized || !timings || count == 0) return;
 
-    // Convert microsecond timing array to RMT symbols
-    // Each pair is (mark, space) or a single ending mark
     size_t symbol_count = count / 2;
-
-    rmt_symbol_word_t* symbols = (rmt_symbol_word_t*)heap_caps_malloc(
-        symbol_count * sizeof(rmt_symbol_word_t), MALLOC_CAP_8BIT
-    );
+    rmt_symbol_word_t* symbols = (rmt_symbol_word_t*)calloc(symbol_count, sizeof(rmt_symbol_word_t));
     if (!symbols) return;
 
     for (size_t i = 0; i < symbol_count; i++) {
         symbols[i].duration0 = timings[i * 2];
-        symbols[i].level0 = 1; // mark
-        if (i * 2 + 1 < count) {
-            symbols[i].duration1 = timings[i * 2 + 1];
-            symbols[i].level1 = 0; // space
-        } else {
-            symbols[i].duration1 = 0;
-            symbols[i].level1 = 0;
-        }
+        symbols[i].level0 = 1;
+        symbols[i].duration1 = (i * 2 + 1 < count) ? timings[i * 2 + 1] : 0;
+        symbols[i].level1 = 0;
     }
 
-    rmt_tx_config_t tx_config = {
-        .loop_count = 0,
-        .flags = { .stop_at_end = true }
-    };
-
-    rmt_transmit(m_tx_channel, m_encoder, symbols,
-                  symbol_count * sizeof(rmt_symbol_word_t), &tx_config);
-    rmt_tx_wait_all_done(m_tx_channel, pdMS_TO_TICKS(1000));
-
-    heap_caps_free(symbols);
+    send_symbols(symbols, symbol_count, 1);
+    free(symbols);
 }
 
 void IRControl::stop() {
-    if (m_initialized && m_tx_channel) {
+    if (m_tx_channel) {
         rmt_disable(m_tx_channel);
-        rmt_enable(m_tx_channel);
+        rmt_del_channel(m_tx_channel);
+        m_tx_channel = nullptr;
     }
+    if (m_encoder) {
+        m_encoder = nullptr; // encoder is auto-deleted with channel
+    }
+    m_initialized = false;
 }
 
 void IRControl::set_carrier_freq(uint32_t freq_hz) {
     m_carrier_freq = freq_hz;
     if (m_initialized && m_tx_channel) {
         rmt_carrier_config_t carrier_config = {
-            .carrier_en = true,
-            .carrier_level = 1,
-            .carrier_duty_percent = 50,
-            .carrier_freq_hz = freq_hz,
+            .frequency_hz = freq_hz,
+            .duty_cycle = 0.5,
         };
         rmt_apply_carrier(m_tx_channel, &carrier_config);
     }
-}
-
-void IRControl::build_nec_symbols(rmt_symbol_word_t* symbols, uint16_t address, uint16_t command, size_t* idx) {
-    size_t i = *idx;
-
-    // NEC header
-    symbols[i].duration0 = NEC_HEADER_HIGH;
-    symbols[i].level0 = 1;
-    symbols[i].duration1 = NEC_HEADER_LOW;
-    symbols[i].level1 = 0;
-    i++;
-
-    // 32 data bits: address (8) + ~address (8) + command (8) + ~command (8)
-    uint32_t frame = 0;
-    uint8_t addr_low = address & 0xFF;
-    uint8_t addr_high = (address >> 8) & 0xFF;
-    uint8_t cmd_low = command & 0xFF;
-    uint8_t cmd_high = (command >> 8) & 0xFF;
-
-    // Standard NEC: address + ~address + command + ~command
-    uint32_t nec_data = ((uint32_t)addr_low) |
-                        ((uint32_t)(~addr_low & 0xFF) << 8) |
-                        ((uint32_t)cmd_low << 16) |
-                        ((uint32_t)(~cmd_low & 0xFF) << 24);
-
-    // Also support extended NEC (16-bit address)
-    // If high byte of address is non-zero, send 16-bit address
-    if (addr_high != 0) {
-        nec_data = ((uint32_t)address) |
-                   ((uint32_t)command << 16);
-    }
-
-    for (int bit = 0; bit < 32; bit++) {
-        bool is_one = (nec_data >> bit) & 1;
-
-        symbols[i].duration0 = NEC_BIT1_HIGH;
-        symbols[i].level0 = 1;
-        symbols[i].duration1 = is_one ? NEC_BIT1_LOW : NEC_BIT0_LOW;
-        symbols[i].level1 = 0;
-        i++;
-    }
-
-    // Stop bit (just a pulse with no trailing space)
-    symbols[i].duration0 = NEC_BIT1_HIGH;
-    symbols[i].level0 = 1;
-    symbols[i].duration1 = 0;
-    symbols[i].level1 = 0;
-    i++;
-
-    *idx = i;
 }

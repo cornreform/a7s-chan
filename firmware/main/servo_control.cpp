@@ -278,12 +278,12 @@ float ServoControl::raw_to_degrees(int32_t raw) {
 void ServoControl::set_direction_tx() {
     // For half-duplex UART, enable transmitter, disable receiver
     // Use GPIO to control direction if needed
-    uart_set_mode(m_uart_num, UART_MODE_TX_ONLY);
+    uart_set_mode(m_uart_num, UART_MODE_RS485_HALF_DUPLEX);
     gpio_set_level((gpio_num_t)SCS_DIR_PIN_GPIO, 1);
 }
 
 void ServoControl::set_direction_rx() {
-    uart_set_mode(m_uart_num, UART_MODE_RX_ONLY);
+    uart_set_mode(m_uart_num, UART_MODE_RS485_HALF_DUPLEX);
     gpio_set_level((gpio_num_t)SCS_DIR_PIN_GPIO, 0);
 }
 
