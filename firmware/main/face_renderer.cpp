@@ -34,19 +34,9 @@ FaceRenderer::~FaceRenderer() {
 }
 
 bool FaceRenderer::begin() {
-    // Initialize LovyanGFX display for M5Stack CoreS3
-    // SPI display config
-    auto cfg = m_lcd.getPanel()->board().m5stack;
-    cfg.backlight_level = 128; // Default brightness
-    cfg.pin_cs   = CORE3_LCD_CS;
-    cfg.pin_mosi = CORE3_LCD_MOSI;
-    cfg.pin_sclk = CORE3_LCD_SCK;
-    cfg.pin_dc   = CORE3_LCD_DC;
-    cfg.pin_rst  = CORE3_LCD_RST;
-    cfg.pin_bl   = CORE3_LCD_BL;
-
+    // LovyanGFX auto-detects M5Stack CoreS3
     m_lcd.begin();
-    m_lcd.setRotation(1); // Landscape orientation
+    m_lcd.setRotation(1);
     m_lcd.setBrightness(200);
     m_lcd.fillScreen(TFT_BLACK);
 
