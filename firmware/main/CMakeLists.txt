@@ -22,5 +22,6 @@ idf_component_register(
         esp_timer
         spi_flash
         newlib
-        fatfs
+        esp_lcd
+        esp_mm
 )
