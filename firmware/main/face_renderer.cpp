@@ -87,17 +87,16 @@ void FaceRenderer::clear(uint16_t color) {
 
 void FaceRenderer::render() {
     if (!m_panel) return;
+    esp_err_t err;
     for (int y = 0; y < LCD_HEIGHT; y++) {
         for (int x = 0; x < LCD_WIDTH; x++) m_line_buf[x] = 0;
         int fy = y - m_cy;
-        // Face outline
         if (fy >= -95 && fy <= 95) {
             for (int x = 0; x < LCD_WIDTH; x++) {
                 float rx = (x-m_cx)/85.0f, ry = fy/95.0f;
                 if (rx*rx + ry*ry <= 1.0f) m_line_buf[x] = 0xFFDC;
             }
         }
-        // Features
         if (fy >= -95 && fy <= 95) {
             draw_eye_line(fy, -35, -15, m_current_params, true);
             draw_eye_line(fy, 35, -15, m_current_params, false);
@@ -111,8 +110,10 @@ void FaceRenderer::render() {
                 draw_tears_line(fy, 35, -15, m_current_params);
             }
         }
-        esp_lcd_panel_draw_bitmap(m_panel, 0, y, LCD_WIDTH, y+1, m_line_buf);
+        err = esp_lcd_panel_draw_bitmap(m_panel, 0, y, LCD_WIDTH, y+1, m_line_buf);
+        if (err != ESP_OK) { ESP_LOGE(TAG, "render line %d err %d", y, err); break; }
     }
+    if (err == ESP_OK) ESP_LOGI(TAG, "render OK");
 }
 
 void FaceRenderer::draw_eye_line(int fy, int cx, int cy, const expression_params_t& p, bool is_left) {
