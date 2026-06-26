@@ -52,6 +52,7 @@ void FaceRenderer::lcd_init() {
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev_cfg, &m_spi));
 
     // Reset LCD
+    gpio_set_direction(CORE3_LCD_DC, GPIO_MODE_OUTPUT);
     gpio_set_direction(CORE3_LCD_RST, GPIO_MODE_OUTPUT);
     gpio_set_level(CORE3_LCD_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -109,8 +110,18 @@ void FaceRenderer::send_line(int y) {
 
 bool FaceRenderer::begin() {
     lcd_init();
-    clear(0x0000);
+    
+    // Test: fill screen red to verify LCD works
+    for (int x = 0; x < LCD_WIDTH; x++) m_line_buf[x] = 0xF800;
     for (int y = 0; y < LCD_HEIGHT; y++) send_line(y);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Test: fill screen green
+    for (int x = 0; x < LCD_WIDTH; x++) m_line_buf[x] = 0x07E0;
+    for (int y = 0; y < LCD_HEIGHT; y++) send_line(y);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    clear(0x0000);
     render();
     return true;
 }
