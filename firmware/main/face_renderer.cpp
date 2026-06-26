@@ -294,14 +294,12 @@ void FaceRenderer::draw_eye_line(int line_y, int cx, int cy, const expression_pa
     int pupil_r = 5;
     int px = cx + (int)(p.eye_width * 3 - 1.5f);
     int py = cy + (int)(p.eye_height * 3 - 1.5f);
-    draw_pupil(px, py, cx, cy, p, is_left, fy);
+    draw_pupil(px, py, fy);
 }
 
-void FaceRenderer::draw_pupil(int px, int py, int cx, int cy, const expression_params_t& p, bool is_left, int line_y) {
-    (void)p; (void)is_left;
+void FaceRenderer::draw_pupil(int px, int py, int line_y) {
     int fy = line_y - py;
     if (abs(fy) > 5) return;
-
     int pupil_r = 5;
     for (int x = -pupil_r; x <= pupil_r; x++) {
         if (px + x < 0 || px + x >= LCD_WIDTH) continue;

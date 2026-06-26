@@ -2,13 +2,18 @@
 
 #include <cstdint>
 #include "expressions.h"
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_vendor.h"
 #include "esp_timer.h"
 
-// M5Stack CoreS3 LCD pins
+// M5Stack CoreS3 LCD pins (GPIO35 = DC shared with MISO)
+#define CORE3_LCD_CS    GPIO_NUM_5
+#define CORE3_LCD_MOSI  GPIO_NUM_6
+#define CORE3_LCD_SCK   GPIO_NUM_7
+#define CORE3_LCD_DC    GPIO_NUM_35
+#define CORE3_LCD_RST   GPIO_NUM_9
+#define CORE3_LCD_BL    GPIO_NUM_38
+
 #define LCD_WIDTH  320
 #define LCD_HEIGHT 240
 
@@ -29,31 +34,27 @@ public:
     bool is_tweening() const { return m_tweening; }
 
 private:
-    expression_id_t m_current_id;
-    expression_id_t m_target_id;
-    expression_params_t m_current_params;
-    expression_params_t m_target_params;
+    expression_id_t m_current_id, m_target_id;
+    expression_params_t m_current_params, m_target_params;
     bool m_tweening;
-    uint32_t m_tween_start;
-    uint32_t m_tween_duration;
-    uint32_t m_last_blink;
+    uint32_t m_tween_start, m_tween_duration, m_last_blink;
     bool m_eye_state;
-
-    esp_lcd_panel_io_handle_t m_io_handle;
-    esp_lcd_panel_handle_t m_panel_handle;
-
-    // Line buffer
     uint16_t m_line_buf[LCD_WIDTH];
+    spi_device_handle_t m_spi;
+    int m_cx, m_cy;
+    uint16_t m_skin_color;
 
+    void lcd_init();
+    void lcd_write_cmd(uint8_t cmd);
+    void lcd_write_data(const uint8_t* data, size_t len);
+    void lcd_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
+    void send_line(int y);
     void draw_face_outline(int y);
     void draw_eye_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
-    void draw_pupil(int px, int py, int cx, int cy, const expression_params_t& p, bool is_left, int line_y);
+    void draw_pupil(int px, int py, int line_y);
     void draw_eyebrow_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
     void draw_mouth_line(int line_y, int cx, int cy, const expression_params_t& p);
     void draw_blush_line(int line_y, int cx, int cy, const expression_params_t& p);
     void draw_tears_line(int line_y, int cx, int cy, const expression_params_t& p);
     void draw_heart_eyes_line(int line_y, int cx, int cy, const expression_params_t& p, bool is_left);
-
-    int m_cx, m_cy;
-    uint16_t m_skin_color;
 };
