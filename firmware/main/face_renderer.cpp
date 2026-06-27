@@ -9,21 +9,20 @@ FaceRenderer::FaceRenderer()
     : m_current_id(EXPR_IDLE), m_target_id(EXPR_IDLE)
     , m_tweening(false), m_eye_state(true)
     , m_tween_start(0), m_tween_duration(0), m_last_blink(0)
-    , m_panel(nullptr)
+    , m_panel(nullptr), m_cx(120), m_cy(160)
 {
     const auto* n = get_expression_params(EXPR_IDLE);
     m_current_params = *n; m_target_params = *n;
 }
 
 bool FaceRenderer::begin() {
-    const bsp_display_config_t cfg = { .max_transfer_sz = LCD_WIDTH * 80 * 2 };
+    const bsp_display_config_t cfg = { .max_transfer_sz = 240 * 80 * 2 };
     esp_lcd_panel_io_handle_t io = NULL;
-    esp_err_t err = bsp_display_new(&cfg, &m_panel, &io);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "bsp_display_new failed: %d", err); return false; }
+    ESP_ERROR_CHECK(bsp_display_new(&cfg, &m_panel, &io));
     bsp_display_brightness_init();
     bsp_display_backlight_on();
     esp_lcd_panel_disp_on_off(m_panel, true);
-    // Orientation: swap XY + mirror Y for landscape ILI9342C
+    // Orientation: swap XY + mirror corrects ILI9342C landscape mount
     esp_lcd_panel_swap_xy(m_panel, true);
     esp_lcd_panel_mirror(m_panel, false, true);
     ESP_LOGI(TAG, "Display ready");
@@ -80,88 +79,123 @@ void FaceRenderer::clear(uint16_t color) {
         esp_lcd_panel_draw_bitmap(m_panel, 0, y, 240, y+1, m_line_buf);
 }
 
+// After swap_xy: drawing space is 240 wide x 320 tall
+// Line buffer = 240 pixels (one row)
+// Render iterates y=0..319 (rows), draws features in face-space coordinates
+
 void FaceRenderer::render() {
     if (!m_panel) return;
-    const int W = 240;  // after swap_xy
-    const int H = 320;
-    int cx = W/2, cy = H/2 - 10;
-    uint16_t skin = 0xFFDC, black = 0x0000, red = 0xF800;
     auto& p = m_current_params;
-
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) m_line_buf[x] = black;
-        int fy = y - cy;
-
-        // Face oval
+    
+    // Colors in RGB565 (BSP inverts, so we'll see inverted on screen)
+    uint16_t skin = 0xFFDC;  // light peach
+    uint16_t white = 0xFFFF;
+    uint16_t black = 0x0000;
+    uint16_t pink = 0xFD20;
+    uint16_t red = 0xF800;
+    uint16_t bg = 0x0841;   // dark gray (will invert to light)
+    uint16_t eye_white = 0xFFFF;
+    uint16_t pupil = 0x0000;
+    uint16_t highlight = 0xFFFF;
+    uint16_t mouth_c = 0x0000;
+    
+    float eye_open = p.eye_open * (m_eye_state ? 1.0f : 0.2f);
+    if (eye_open < 0.1f) eye_open = 0.1f;
+    
+    for (int y = 0; y < 320; y++) {
+        // Clear line
+        for (int x = 0; x < 240; x++) m_line_buf[x] = bg;
+        
+        int fy = y - m_cy;  // face Y: -160 to +159
+        
+        // === FACE OUTLINE (round/oval) ===
         if (fy >= -130 && fy <= 130) {
-            for (int x = 0; x < W; x++) {
-                float rx = (x-cx)/95.0f, ry = fy/125.0f;
-                if (rx*rx + ry*ry <= 1.0f) m_line_buf[x] = skin;
+            for (int x = 0; x < 240; x++) {
+                int fx = x - m_cx;
+                float rx = fx/100.0f, ry = fy/125.0f;
+                if (rx*rx + ry*ry <= 1.05f) m_line_buf[x] = skin;
             }
         }
-
-        // Robot eyes (big circles)
-        int eye_y = -35, eye_r = 18, spacing = 35;
-        float open = p.eye_open * (m_eye_state ? 1.0f : 0.15f);
-        if (open < 0.1f) open = 0.1f;
-        draw_circle_eye(fy, cx-spacing, cy+eye_y, eye_r, open, p);
-        draw_circle_eye(fy, cx+spacing, cy+eye_y, eye_r, open, p);
-
-        // Mouth (line)
-        int my = cy + 55, mw = 25 + (int)(p.mouth_open * 20);
-        int mh = 2 + (int)(p.mouth_open * 4);
+        
+        // === EYES ===
+        int eye_y = -30;
+        int eye_lx = m_cx - 35, eye_rx = m_cx + 35;
+        int eye_r = 17;
+        int vis_r = (int)(eye_r * eye_open);
+        
+        // Draw each eye
+        int eye_xs[2] = {eye_lx, eye_rx};
+        for (int ei = 0; ei < 2; ei++) {
+            int ex = eye_xs[ei];
+            int rel_y = fy - (m_cy + eye_y);
+            if (abs(rel_y) > vis_r + 2) continue;
+            
+            for (int x = ex - eye_r - 2; x <= ex + eye_r + 2; x++) {
+                if (x < 0 || x >= 240) continue;
+                float d = (x-ex)*(x-ex) + rel_y*rel_y;
+                
+                if (d <= eye_r*eye_r) {
+                    // Eye white
+                    m_line_buf[x] = eye_white;
+                    
+                    // Pupil
+                    int px = ex + (int)(p.eye_width * 3);
+                    int py = m_cy + eye_y + (int)(p.eye_height * 3);
+                    int pr = 6;
+                    int pdx = x - px, pdy = fy - py;
+                    if (pdx*pdx + pdy*pdy <= pr*pr) m_line_buf[x] = pupil;
+                    
+                    // Highlight (top-left of pupil)
+                    int hx = px - 2, hy = py - 2;
+                    int hdx = x - hx, hdy = fy - hy;
+                    if (hdx*hdx + hdy*hdy <= 2*2) m_line_buf[x] = highlight;
+                }
+            }
+            
+            // Eyelid (closing)
+            if (eye_open < 0.8f) {
+                int lid_h = (int)(eye_r * (1.0f - eye_open) * 0.6f);
+                if (abs(rel_y) <= lid_h) {
+                    for (int x = ex - eye_r - 2; x <= ex + eye_r + 2; x++)
+                        if (x >= 0 && x < 240) m_line_buf[x] = skin;
+                }
+            }
+        }
+        
+        // === MOUTH ===
+        int mouth_y = m_cy + 55;
+        int mouth_w = 20 + (int)(p.mouth_open * 15);
+        int mouth_h = 2 + (int)(p.mouth_open * 5);
         int curve = (int)((p.mouth_curve - 0.5f) * 8);
-        if (abs(fy - my) <= mh) {
-            for (int x = cx-mw; x <= cx+mw; x++) {
-                if (x < 0 || x >= W) continue;
-                int ly = fy - my + curve;
-                if (abs(ly) <= mh/2)
-                    m_line_buf[x] = (p.mouth_open > 0.3f) ? red : black;
+        
+        if (abs(fy - mouth_y) <= mouth_h) {
+            for (int x = m_cx - mouth_w; x <= m_cx + mouth_w; x++) {
+                if (x < 0 || x >= 240) continue;
+                int ly = fy - mouth_y + curve;
+                if (abs(ly) <= mouth_h/2)
+                    m_line_buf[x] = (p.mouth_open > 0.3f) ? red : mouth_c;
             }
         }
-
-        // Blush
+        
+        // === BLUSH ===
         if (p.blush > 0.05f) {
-            int br = 6 + (int)(p.blush * 6);
-            int bx[2] = {cx-55, cx+55};
-            for (int i = 0; i < 2; i++) {
-                int bx_ = bx[i];
-                if (abs(fy - (cy+15)) <= br) {
-                    int ry = fy - (cy+15);
-                    for (int x = bx_-br; x <= bx_+br; x++) {
-                        if (x < 0 || x >= W) continue;
-                        if (((x-bx_)*(x-bx_)+ry*ry) <= br*br)
-                            m_line_buf[x] = 0xFD20;
+            int br = 6 + (int)(p.blush * 5);
+            int by = m_cy + 15;
+            int blush_xs[2] = {m_cx - 52, m_cx + 52};
+            for (int bi = 0; bi < 2; bi++) {
+                int bx = blush_xs[bi];
+                if (abs(fy - by) <= br) {
+                    int ry = fy - by;
+                    for (int x = bx - br; x <= bx + br; x++) {
+                        if (x < 0 || x >= 240) continue;
+                        if ((x-bx)*(x-bx) + ry*ry <= br*br)
+                            m_line_buf[x] = pink;
                     }
                 }
             }
         }
-
-        esp_lcd_panel_draw_bitmap(m_panel, 0, y, W, y+1, m_line_buf);
-    }
-}
-
-void FaceRenderer::draw_circle_eye(int fy, int ex, int ey, int r, float open, const expression_params_t& p) {
-    int rel_y = fy - ey;
-    int vis_r = (int)(r * open);
-    if (abs(rel_y) > vis_r + 2) return;
-
-    for (int x = ex-r-1; x <= ex+r+1; x++) {
-        if (x < 0 || x >= 240) continue;
-        float d = (x-ex)*(x-ex) + rel_y*rel_y;
-        if (d <= r*r) {
-            m_line_buf[x] = 0xFFFF;
-            int px = ex + (int)(p.eye_width * 4 - 1);
-            int py = ey + (int)(p.eye_height * 4 - 1);
-            if ((x-px)*(x-px) + (rel_y-(py-ey))*(rel_y-(py-ey)) <= 25)
-                m_line_buf[x] = 0x0000;
-        }
-    }
-    // Eyelid
-    if (open < 0.8f) {
-        int lid_h = (int)(r * (1.0f - open) * 0.6f);
-        if (abs(rel_y) <= lid_h)
-            for (int x = ex-r-1; x <= ex+r+1; x++)
-                if (x >= 0 && x < 240) m_line_buf[x] = 0xFFDC;
+        
+        // Send row to display
+        esp_lcd_panel_draw_bitmap(m_panel, 0, y, 240, y+1, m_line_buf);
     }
 }

@@ -3,7 +3,9 @@
 #include "expressions.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_timer.h"
-#define LCD_WIDTH 320
+
+// Physical display dimensions
+#define LCD_WIDTH  320
 #define LCD_HEIGHT 240
 
 class FaceRenderer {
@@ -22,12 +24,9 @@ public:
 private:
     expression_id_t m_current_id, m_target_id;
     expression_params_t m_current_params, m_target_params;
-    bool m_tweening;
-    bool m_eye_state;
-    uint32_t m_tween_start;
-    uint32_t m_tween_duration;
-    uint32_t m_last_blink;
+    bool m_tweening, m_eye_state;
+    uint32_t m_tween_start, m_tween_duration, m_last_blink;
     uint16_t m_line_buf[240];
     esp_lcd_panel_handle_t m_panel;
-    void draw_circle_eye(int fy, int ex, int ey, int r, float open, const expression_params_t& p);
+    int m_cx, m_cy; // face center in drawing space
 };
