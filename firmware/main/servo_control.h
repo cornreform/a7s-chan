@@ -62,7 +62,7 @@ public:
     ~ServoControl();
 
     // Initialize UART for servo bus
-    bool begin(uart_port_t uart_num = UART_NUM_1, int tx_pin = 13, int rx_pin = 14);
+    bool begin(uart_port_t uart_num = UART_NUM_1, int tx_pin = 6, int rx_pin = 7);
 
     // Set pan angle (0-360 degrees)
     void set_pan(float degrees);
