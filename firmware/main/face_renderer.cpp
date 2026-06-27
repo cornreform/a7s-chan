@@ -76,9 +76,9 @@ void FaceRenderer::update(uint32_t now) {
 // Only BIG eyes + small mouth line (robot style)
 void FaceRenderer::clear(uint16_t color) {
     if (!m_panel) return;
-    for (int i = 0; i < 240; i++) m_line_buf[i] = color;
-    for (int y = 0; y < 320; y++)
-        esp_lcd_panel_draw_bitmap(m_panel, 0, y, 240, y+1, m_line_buf);
+    for (int i = 0; i < 320; i++) m_line_buf[i] = color;
+    for (int y = 0; y < 240; y++)
+        esp_lcd_panel_draw_bitmap(m_panel, 0, y, 320, y+1, m_line_buf);
 }
 
 void FaceRenderer::render() {
@@ -102,8 +102,10 @@ void FaceRenderer::render() {
     uint16_t pupil_c = 0x2104;  // dark gray pupil
     uint16_t accent = 0x7BEF;   // light gray outline
     
-    int W = 240, H = 320;
-    
+    // After swap_xy: driver swaps x/y internally, MADCTL MV=1 swaps again
+    // Double swap = logical/physical match → use 320x240
+    int W = 320, H = 240;
+    int cx = W/2, cy = H/2 - 5;
     for (int y = 0; y < H; y++) {
         // Clear line
         for (int x = 0; x < W; x++) m_line_buf[x] = black;
