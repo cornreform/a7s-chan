@@ -22,9 +22,11 @@ bool FaceRenderer::begin() {
     bsp_display_brightness_init();
     bsp_display_backlight_on();
     esp_lcd_panel_disp_on_off(m_panel, true);
-    // NO swap_xy, NO mirror — use BSP default orientation
-    // The ILI9342C in landscape: 320x240, default MADCTL = correct
-    ESP_LOGI(TAG, "Display ready (landscape)");
+    // BSP default orientation — won't touch MADCTL
+    // Instead, use esp_lcd_panel_* functions with correct values for CoreS3
+    esp_lcd_panel_swap_xy(m_panel, true);
+    esp_lcd_panel_mirror(m_panel, true, false);
+    ESP_LOGI(TAG, "Display ready (MADCTL optimized)");
     render();
     return true;
 }
@@ -78,8 +80,7 @@ void FaceRenderer::clear(uint16_t color) {
         esp_lcd_panel_draw_bitmap(m_panel, 0, y, 320, y+1, m_line_buf);
 }
 
-// Drawing in PHYSICAL space: 320 wide x 240 tall (landscape)
-// No swap_xy — BSP default orientation
+// Drawing in LOGICAL space: 240 wide x 320 tall (after swap_xy)
 void FaceRenderer::render() {
     if (!m_panel) return;
     auto& p = m_current_params;
@@ -90,86 +91,78 @@ void FaceRenderer::render() {
     uint16_t black = 0x0000;
     uint16_t pink = 0xFD20;
     uint16_t red = 0xF800;
+    int W = 240, H = 320;
+    int cx = W/2, cy = H/2 - 10;
     
     float eye_open = p.eye_open * (m_eye_state ? 1.0f : 0.15f);
     if (eye_open < 0.1f) eye_open = 0.1f;
     
-    for (int y = 0; y < 240; y++) {
-        for (int x = 0; x < 320; x++) m_line_buf[x] = bg;
-        int fy = y - m_cy;  // -120 to +119
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) m_line_buf[x] = bg;
+        int fy = y - cy;  // -160 to +159
         
         // === FACE OVAL ===
-        if (fy >= -100 && fy <= 100) {
-            for (int x = 0; x < 320; x++) {
-                int fx = x - m_cx;
-                float rx = fx/130.0f, ry = fy/100.0f;
+        if (fy >= -120 && fy <= 120) {
+            for (int x = 0; x < W; x++) {
+                int fx = x - cx;
+                float rx = fx/95.0f, ry = fy/115.0f;
                 if (rx*rx + ry*ry <= 1.05f) m_line_buf[x] = skin;
             }
         }
         
         // === ROBOT EYES (circles) ===
-        int eye_y = -20;
-        int eye_r = 22;
-        int eye_spacing = 50;
+        int eye_y = -25;
+        int eye_r = 18;
+        int eye_spacing = 32;
         int vis_r = (int)(eye_r * eye_open);
         
-        int eye_centers[2] = {m_cx - eye_spacing, m_cx + eye_spacing};
+        int eyes[2] = {cx - eye_spacing, cx + eye_spacing};
         for (int ei = 0; ei < 2; ei++) {
-            int ex = eye_centers[ei];
-            int ey = m_cy + eye_y;
+            int ex = eyes[ei], ey = cy + eye_y;
             int rel_y = fy - ey;
             if (abs(rel_y) > vis_r + 2) continue;
-            
             for (int x = ex - eye_r - 2; x <= ex + eye_r + 2; x++) {
-                if (x < 0 || x >= 320) continue;
+                if (x < 0 || x >= W) continue;
                 float d = (x-ex)*(x-ex) + rel_y*rel_y;
                 if (d <= eye_r*eye_r) {
                     m_line_buf[x] = white;
-                    
-                    // Pupil
-                    int px = ex + (int)(p.eye_width * 4);
-                    int py = ey + (int)(p.eye_height * 4);
-                    int pdx = x - px, pdy = fy - py;
-                    if (pdx*pdx + pdy*pdy <= 6*6) m_line_buf[x] = black;
-                    
-                    // Highlight
-                    int hdx = x - (px - 2), hdy = fy - (py - 2);
-                    if (hdx*hdx + hdy*hdy <= 2*2) m_line_buf[x] = white;
+                    int px = ex + (int)(p.eye_width * 3);
+                    int py = ey + (int)(p.eye_height * 3);
+                    if ((x-px)*(x-px)+(fy-py)*(fy-py) <= 5*5) m_line_buf[x] = black;
+                    if ((x-(px-2))*(x-(px-2))+(fy-(py-2))*(fy-(py-2)) <= 2*2) m_line_buf[x] = white;
                 }
             }
         }
         
-        // === MOUTH (line) ===
-        int mouth_y = m_cy + 45;
-        int mouth_w = 30 + (int)(p.mouth_open * 15);
-        int mouth_h = 2 + (int)(p.mouth_open * 4);
+        // === MOUTH ===
+        int mouth_y = cy + 45;
+        int mw = 25 + (int)(p.mouth_open * 12);
+        int mh = 2 + (int)(p.mouth_open * 4);
         int curve = (int)((p.mouth_curve - 0.5f) * 6);
-        if (abs(fy - mouth_y) <= mouth_h) {
-            for (int x = m_cx - mouth_w; x <= m_cx + mouth_w; x++) {
-                if (x < 0 || x >= 320) continue;
+        if (abs(fy - mouth_y) <= mh) {
+            for (int x = cx - mw; x <= cx + mw; x++) {
+                if (x < 0 || x >= W) continue;
                 int ly = fy - mouth_y + curve;
-                if (abs(ly) <= mouth_h/2)
-                    m_line_buf[x] = (p.mouth_open > 0.3f) ? red : black;
+                if (abs(ly) <= mh/2) m_line_buf[x] = black;
             }
         }
         
         // Blush
         if (p.blush > 0.05f) {
-            int br = 5 + (int)(p.blush * 6);
-            int by = m_cy + 5;
-            int bx[2] = {m_cx - 68, m_cx + 68};
+            int br = 5 + (int)(p.blush * 5);
+            int by = cy + 5;
+            int bx[2] = {cx - 55, cx + 55};
             for (int bi = 0; bi < 2; bi++) {
                 if (abs(fy - by) <= br) {
                     int ry = fy - by;
-                    for (int x = bx[bi] - br; x <= bx[bi] + br; x++) {
-                        if (x < 0 || x >= 320) continue;
-                        if ((x-bx[bi])*(x-bx[bi]) + ry*ry <= br*br)
-                            m_line_buf[x] = pink;
+                    for (int x = bx[bi]-br; x <= bx[bi]+br; x++) {
+                        if (x < 0 || x >= W) continue;
+                        if ((x-bx[bi])*(x-bx[bi])+ry*ry <= br*br) m_line_buf[x] = pink;
                     }
                 }
             }
         }
         
-        esp_lcd_panel_draw_bitmap(m_panel, 0, y, 320, y+1, m_line_buf);
+        esp_lcd_panel_draw_bitmap(m_panel, 0, y, W, y+1, m_line_buf);
     }
 }
