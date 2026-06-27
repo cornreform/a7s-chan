@@ -221,10 +221,6 @@ extern "C" void app_main(void) {
             read_imu_data(&status);
 
             // Servo state
-            status.servo_pan_pos = pan_state.current_position;
-            status.servo_tilt_pos = tilt_state.current_position;
-            status.servo_pan_temp = pan_state.temperature;
-            status.servo_tilt_temp = tilt_state.temperature;
 
             // Expression
             strncpy(status.current_expression,
