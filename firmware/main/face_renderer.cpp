@@ -85,7 +85,7 @@ void FaceRenderer::render() {
     const int W = 240;  // after swap_xy
     const int H = 320;
     int cx = W/2, cy = H/2 - 10;
-    uint16_t skin = 0xFFDC, white = 0xFFFF, black = 0x0000, red = 0xF800;
+    uint16_t skin = 0xFFDC, black = 0x0000, red = 0xF800;
     auto& p = m_current_params;
 
     for (int y = 0; y < H; y++) {

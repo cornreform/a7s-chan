@@ -443,12 +443,12 @@ static void wifi_init_sta(void) {
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
-                                                        &event_handlerwifi_event_handlerwifi_event_handler,
+                                                        &event_handlerwifi_event_handlerwifi_event_handlerwifi_event_handlerwifi_event_handler,
                                                         NULL,
                                                         &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
-                                                        &event_handlerwifi_event_handlerwifi_event_handler,
+                                                        &event_handlerwifi_event_handlerwifi_event_handlerwifi_event_handlerwifi_event_handler,
                                                         NULL,
                                                         &instance_got_ip));
 
