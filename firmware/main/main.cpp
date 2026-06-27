@@ -202,13 +202,11 @@ extern "C" void app_main(void) {
         // Update LEDs
         g_led_control.update(now_ms);
 
-        // Poll servo positions periodically
-        if (now_ms - last_servo_poll_ms > 500) {
-            last_servo_poll_ms = now_ms;
-            g_servo_control.read_state(1);
-            g_servo_control.read_state(2);
-        }
-
+        uint32_t last_servo_poll_ms = 0;
+            if (now_ms - last_servo_poll_ms > 500) {
+                last_servo_poll_ms = now_ms;
+                g_servo_control.set_pan(g_servo_control.current_pan);
+                g_servo_control.set_tilt(g_servo_control.current_tilt);
         // Send status to A7S periodically
         if (s_wifi_connected && (now_ms - last_status_ms > STATUS_INTERVAL_MS)) {
             last_status_ms = now_ms;
