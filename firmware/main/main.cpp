@@ -418,20 +418,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_count = 0;
+        s_wifi_connected = true;
+        s_wifi_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
 static void wifi_init_sta(void) {
-    // WiFi credentials (try in order)
-    const char* ssids[] = {WIFI_SSID, WIFI_SSID2};
-    const char* passes[] = {WIFI_PASS, WIFI_PASS2};
-    int num_networks = sizeof(ssids) / sizeof(ssids[0]);
-
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-    
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -449,41 +446,26 @@ static void wifi_init_sta(void) {
                                                         &instance_got_ip));
 
     wifi_config_t wifi_config = {};
-    // Try each network
-    for (int i = 0; i < num_networks; i++) {
-        memset(&wifi_config, 0, sizeof(wifi_config));
-        strncpy((char*)wifi_config.sta.ssid, ssids[i], sizeof(wifi_config.sta.ssid) - 1);
-        strncpy((char*)wifi_config.sta.password, passes[i], sizeof(wifi_config.sta.password) - 1);
-        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-        wifi_config.sta.pmf_cfg.capable = true;
-        wifi_config.sta.pmf_cfg.required = false;
-        
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-        ESP_ERROR_CHECK(esp_wifi_start());
-        
-        ESP_LOGI(TAG, "Connecting to WiFi SSID: %s (attempt %d/%d)", ssids[i], i+1, num_networks);
-        
-        // Wait for connection with timeout
-        s_wifi_connected = false;
-        int retry_count = 0;
-        while (!s_wifi_connected && retry_count < 20) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            retry_count++;
-        }
-        
-        if (s_wifi_connected) {
-            ESP_LOGI(TAG, "Connected to %s!", ssids[i]);
-            return;
-        }
-        
-        // Disconnect and try next
-        esp_wifi_disconnect();
-        esp_wifi_stop();
-        ESP_LOGW(TAG, "Failed to connect to %s, trying next...", ssids[i]);
-    }
-    
+    strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
 
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", WIFI_SSID);
+
+    // Wait for connection
+    s_wifi_connected = false;
+    int cwait = 0;
+    while (!s_wifi_connected && cwait < 20) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        cwait++;
+    }
+}
 }
 
 // ============================================================
