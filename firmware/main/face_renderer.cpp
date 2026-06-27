@@ -74,6 +74,13 @@ void FaceRenderer::update(uint32_t now) {
 
 // Render: 240x320 logical space (after swap_xy)
 // Only BIG eyes + small mouth line (robot style)
+void FaceRenderer::clear(uint16_t color) {
+    if (!m_panel) return;
+    for (int i = 0; i < 240; i++) m_line_buf[i] = color;
+    for (int y = 0; y < 320; y++)
+        esp_lcd_panel_draw_bitmap(m_panel, 0, y, 240, y+1, m_line_buf);
+}
+
 void FaceRenderer::render() {
     if (!m_panel) return;
     auto& p = m_current_params;
