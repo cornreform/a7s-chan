@@ -26,7 +26,7 @@ private:
     expression_params_t m_current_params, m_target_params;
     bool m_tweening, m_eye_state;
     uint32_t m_tween_start, m_tween_duration, m_last_blink;
-    uint16_t m_line_buf[240];
+    uint16_t m_line_buf[320];
     esp_lcd_panel_handle_t m_panel;
     int m_cx, m_cy; // face center in drawing space
 };
