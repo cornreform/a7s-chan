@@ -56,8 +56,8 @@ bool ServoControl::init_py32() {
     // Initialize I2C bus
     const i2c_master_bus_config_t bus_cfg = {
         .i2c_port = PY32_I2C_NUM,
-        .sda_io_num = PY32_I2C_SDA,
-        .scl_io_num = PY32_I2C_SCL,
+        .sda_io_num = (gpio_num_t)PY32_I2C_SDA,
+        .scl_io_num = (gpio_num_t)PY32_I2C_SCL,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .flags = { .enable_internal_pullup = true },
     };
