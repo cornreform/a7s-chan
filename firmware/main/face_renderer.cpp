@@ -25,7 +25,7 @@ bool FaceRenderer::begin() {
     // BSP default orientation — won't touch MADCTL
     // Instead, use esp_lcd_panel_* functions with correct values for CoreS3
     esp_lcd_panel_swap_xy(m_panel, true);
-    esp_lcd_panel_mirror(m_panel, true, false);
+    esp_lcd_panel_mirror(m_panel, false, true);
     ESP_LOGI(TAG, "Display ready (MADCTL optimized)");
     render();
     return true;
