@@ -30,6 +30,10 @@ static const char* TAG = "StackChan";
 // WiFi configuration (hardcoded)
 #define WIFI_SSID           "SC"
 #define WIFI_PASS           "8447Ce8086"
+
+// Additional WiFi networks (will try in order)
+#define WIFI_SSID2          "NextE"
+#define WIFI_PASS2          "NXE5w526"
 #define WIFI_MAX_RETRY      5
 
 // Free heap threshold warning
@@ -145,16 +149,9 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Connecting to WiFi...");
     wifi_init_sta();
 
-    // Wait briefly for WiFi connection (non-blocking)
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));  // 5s timeout
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        s_wifi_connected = true;
+    // WiFi connection result (multi-SSID handled in wifi_init_sta)
+    if (s_wifi_connected) {
         ESP_LOGI(TAG, "WiFi connected! Starting UDP server...");
-
-        // Initialize UDP client
         if (!g_udp_client.begin()) {
             ESP_LOGE(TAG, "UDP client init failed!");
         } else {
@@ -163,7 +160,7 @@ extern "C" void app_main(void) {
             vTaskDelay(pdMS_TO_TICKS(500));
             g_face_renderer.set_expression(EXPR_IDLE);
         }
-    } else if (bits & WIFI_FAIL_BIT) {
+    } else {
         ESP_LOGE(TAG, "WiFi connection failed!");
         g_face_renderer.set_expression(EXPR_SAD);
     }
@@ -430,10 +427,15 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 static void wifi_init_sta(void) {
-    s_wifi_event_group = xEventGroupCreate();
+    // WiFi credentials (try in order)
+    const char* ssids[] = {WIFI_SSID, WIFI_SSID2};
+    const char* passes[] = {WIFI_PASS, WIFI_PASS2};
+    int num_networks = sizeof(ssids) / sizeof(ssids[0]);
 
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-
+    
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -441,34 +443,50 @@ static void wifi_init_sta(void) {
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
+                                                        &event_handlerwifi_event_handlerwifi_event_handler,
                                                         NULL,
                                                         &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
+                                                        &event_handlerwifi_event_handlerwifi_event_handler,
                                                         NULL,
                                                         &instance_got_ip));
 
-    // WiFi credentials
-    #ifndef CONFIG_ESP_WIFI_SSID
-    #define CONFIG_ESP_WIFI_SSID "SC"
-    #endif
-    #ifndef CONFIG_ESP_WIFI_PASSWORD
-    #define CONFIG_ESP_WIFI_PASSWORD "8447Ce8086"
-    #endif
-
     wifi_config_t wifi_config = {};
-    strncpy((char*)wifi_config.sta.ssid, CONFIG_ESP_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char*)wifi_config.sta.password, CONFIG_ESP_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", CONFIG_ESP_WIFI_SSID);
-}
+    // Try each network
+    for (int i = 0; i < num_networks; i++) {
+        memset(&wifi_config, 0, sizeof(wifi_config));
+        strncpy((char*)wifi_config.sta.ssid, ssids[i], sizeof(wifi_config.sta.ssid) - 1);
+        strncpy((char*)wifi_config.sta.password, passes[i], sizeof(wifi_config.sta.password) - 1);
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        wifi_config.sta.pmf_cfg.capable = true;
+        wifi_config.sta.pmf_cfg.required = false;
+        
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+        
+        ESP_LOGI(TAG, "Connecting to WiFi SSID: %s (attempt %d/%d)", ssids[i], i+1, num_networks);
+        
+        // Wait for connection with timeout
+        s_wifi_connected = false;
+        int retry_count = 0;
+        while (!s_wifi_connected && retry_count < 20) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            retry_count++;
+        }
+        
+        if (s_wifi_connected) {
+            ESP_LOGI(TAG, "Connected to %s!", ssids[i]);
+            return;
+        }
+        
+        // Disconnect and try next
+        esp_wifi_disconnect();
+        esp_wifi_stop();
+        ESP_LOGW(TAG, "Failed to connect to %s, trying next...", ssids[i]);
+    }
+    
 
 // ============================================================
 // Button initialization
