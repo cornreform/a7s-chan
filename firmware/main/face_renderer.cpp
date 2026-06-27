@@ -9,7 +9,7 @@ FaceRenderer::FaceRenderer()
     : m_current_id(EXPR_IDLE), m_target_id(EXPR_IDLE)
     , m_tweening(false), m_eye_state(true)
     , m_tween_start(0), m_tween_duration(0), m_last_blink(0)
-    , m_panel(nullptr), m_cx(120), m_cy(160)
+    , m_panel(nullptr), m_cx(160), m_cy(120)
 {
     const auto* n = get_expression_params(EXPR_IDLE);
     m_current_params = *n; m_target_params = *n;
