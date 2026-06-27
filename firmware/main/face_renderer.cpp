@@ -9,7 +9,7 @@ FaceRenderer::FaceRenderer()
     : m_current_id(EXPR_IDLE), m_target_id(EXPR_IDLE)
     , m_tweening(false), m_eye_state(true)
     , m_tween_start(0), m_tween_duration(0), m_last_blink(0)
-    , m_panel(nullptr), m_cx(LCD_WIDTH/2), m_cy(LCD_HEIGHT/2)
+    , m_panel(nullptr)
 {
     const auto* n = get_expression_params(EXPR_IDLE);
     m_current_params = *n; m_target_params = *n;
@@ -20,20 +20,14 @@ bool FaceRenderer::begin() {
     esp_lcd_panel_io_handle_t io = NULL;
     esp_err_t err = bsp_display_new(&cfg, &m_panel, &io);
     if (err != ESP_OK) { ESP_LOGE(TAG, "bsp_display_new failed: %d", err); return false; }
-    
-    // Backlight already set in app_main() - just call BSP backlight too
+    bsp_display_brightness_init();
     bsp_display_backlight_on();
     esp_lcd_panel_disp_on_off(m_panel, true);
-    ESP_LOGI(TAG, "Display ready via BSP");
-    // Fill screen RED using line buffer
-    for (int i = 0; i < LCD_WIDTH; i++) m_line_buf[i] = 0xF800;
-    for (int y = 0; y < LCD_HEIGHT; y++) {
-        err = esp_lcd_panel_draw_bitmap(m_panel, 0, y, LCD_WIDTH, y+1, m_line_buf);
-        if (err != ESP_OK) { ESP_LOGE(TAG, "red line %d failed: %d", y, err); break; }
-    }
-    if (err == ESP_OK) ESP_LOGI(TAG, "RED fill OK");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    set_expression(EXPR_IDLE);
+    // Orientation: swap XY + mirror Y for landscape ILI9342C
+    esp_lcd_panel_swap_xy(m_panel, true);
+    esp_lcd_panel_mirror(m_panel, false, true);
+    ESP_LOGI(TAG, "Display ready");
+    render();
     return true;
 }
 
@@ -81,111 +75,93 @@ void FaceRenderer::update(uint32_t now) {
 
 void FaceRenderer::clear(uint16_t color) {
     if (!m_panel) return;
-    for (int i = 0; i < LCD_WIDTH; i++) m_line_buf[i] = color;
-    for (int y = 0; y < LCD_HEIGHT; y++)
-        esp_lcd_panel_draw_bitmap(m_panel, 0, y, LCD_WIDTH, y+1, m_line_buf);
+    for (int i = 0; i < 240; i++) m_line_buf[i] = color;
+    for (int y = 0; y < 320; y++)
+        esp_lcd_panel_draw_bitmap(m_panel, 0, y, 240, y+1, m_line_buf);
 }
 
 void FaceRenderer::render() {
     if (!m_panel) return;
-    esp_err_t err;
-    for (int y = 0; y < LCD_HEIGHT; y++) {
-        for (int x = 0; x < LCD_WIDTH; x++) m_line_buf[x] = 0;
-        int fy = y - m_cy;
-        if (fy >= -95 && fy <= 95) {
-            for (int x = 0; x < LCD_WIDTH; x++) {
-                float rx = (x-m_cx)/85.0f, ry = fy/95.0f;
-                if (rx*rx + ry*ry <= 1.0f) m_line_buf[x] = 0xFFDC;
+    const int W = 240;  // after swap_xy
+    const int H = 320;
+    int cx = W/2, cy = H/2 - 10;
+    uint16_t skin = 0xFFDC, white = 0xFFFF, black = 0x0000, red = 0xF800;
+    auto& p = m_current_params;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) m_line_buf[x] = black;
+        int fy = y - cy;
+
+        // Face oval
+        if (fy >= -130 && fy <= 130) {
+            for (int x = 0; x < W; x++) {
+                float rx = (x-cx)/95.0f, ry = fy/125.0f;
+                if (rx*rx + ry*ry <= 1.0f) m_line_buf[x] = skin;
             }
         }
-        if (fy >= -95 && fy <= 95) {
-            draw_eye_line(fy, -35, -15, m_current_params, true);
-            draw_eye_line(fy, 35, -15, m_current_params, false);
-            draw_eyebrow_line(fy, -35, -35, m_current_params, true);
-            draw_eyebrow_line(fy, 35, -35, m_current_params, false);
-            draw_mouth_line(fy, 0, 30, m_current_params);
-            draw_blush_line(fy, -45, 0, m_current_params);
-            draw_blush_line(fy, 45, 0, m_current_params);
-            if (m_current_params.tears > 0.1f) {
-                draw_tears_line(fy, -35, -15, m_current_params);
-                draw_tears_line(fy, 35, -15, m_current_params);
+
+        // Robot eyes (big circles)
+        int eye_y = -35, eye_r = 18, spacing = 35;
+        float open = p.eye_open * (m_eye_state ? 1.0f : 0.15f);
+        if (open < 0.1f) open = 0.1f;
+        draw_circle_eye(fy, cx-spacing, cy+eye_y, eye_r, open, p);
+        draw_circle_eye(fy, cx+spacing, cy+eye_y, eye_r, open, p);
+
+        // Mouth (line)
+        int my = cy + 55, mw = 25 + (int)(p.mouth_open * 20);
+        int mh = 2 + (int)(p.mouth_open * 4);
+        int curve = (int)((p.mouth_curve - 0.5f) * 8);
+        if (abs(fy - my) <= mh) {
+            for (int x = cx-mw; x <= cx+mw; x++) {
+                if (x < 0 || x >= W) continue;
+                int ly = fy - my + curve;
+                if (abs(ly) <= mh/2)
+                    m_line_buf[x] = (p.mouth_open > 0.3f) ? red : black;
             }
         }
-        err = esp_lcd_panel_draw_bitmap(m_panel, 0, y, LCD_WIDTH, y+1, m_line_buf);
-        if (err != ESP_OK) { ESP_LOGE(TAG, "render line %d err %d", y, err); break; }
-    }
-    if (err == ESP_OK) ESP_LOGI(TAG, "render OK");
-}
 
-void FaceRenderer::draw_eye_line(int fy, int cx, int cy, const expression_params_t& p, bool is_left) {
-    if (p.heart_eyes > 0.5f) { draw_heart_eyes_line(fy, cx, cy, p, is_left); return; }
-    int ew = 18, eh = (int)(12 * p.eye_height * p.eye_open);
-    if (eh < 2) {
-        if (fy-cy == 0) for (int x = -ew; x <= ew; x++) {
-            int px = m_cx+cx+x; if (px>=0&&px<LCD_WIDTH) m_line_buf[px]=0;
+        // Blush
+        if (p.blush > 0.05f) {
+            int br = 6 + (int)(p.blush * 6);
+            int bx[2] = {cx-55, cx+55};
+            for (int i = 0; i < 2; i++) {
+                int bx_ = bx[i];
+                if (abs(fy - (cy+15)) <= br) {
+                    int ry = fy - (cy+15);
+                    for (int x = bx_-br; x <= bx_+br; x++) {
+                        if (x < 0 || x >= W) continue;
+                        if (((x-bx_)*(x-bx_)+ry*ry) <= br*br)
+                            m_line_buf[x] = 0xFD20;
+                    }
+                }
+            }
         }
-        return;
-    }
-    int ry = fy-cy; if (abs(ry)>eh) return;
-    for (int x=-ew; x<=ew; x++) {
-        int px=m_cx+cx+x; if(px<0||px>=LCD_WIDTH) continue;
-        if((float)(x*x)/(ew*ew)+(float)(ry*ry)/(eh*eh)<=1.0f) m_line_buf[px]=0xFFFF;
-    }
-    draw_pupil(m_cx+cx+(int)(p.eye_width*3-1.5f), cy+(int)(p.eye_height*3-1.5f), fy);
-}
 
-void FaceRenderer::draw_pupil(int px, int py, int fy) {
-    int ry=fy-py; if(abs(ry)>5) return;
-    for(int x=-5;x<=5;x++) { if(px+x<0||px+x>=LCD_WIDTH) continue;
-        if(x*x+ry*ry<=25) m_line_buf[px+x]=0;
-        if(x*x+(ry-2)*(ry-2)<=3) m_line_buf[px+x+2]=0xFFFF;
+        esp_lcd_panel_draw_bitmap(m_panel, 0, y, W, y+1, m_line_buf);
     }
 }
 
-void FaceRenderer::draw_eyebrow_line(int fy, int cx, int cy, const expression_params_t& p, bool is_left) {
-    float a = ((p.brow_angle-0.5f)*20.0f)*(is_left?1:-1);
-    int by=cy+(int)(p.brow_height*8), ry=fy-by;
-    if(abs(ry)>1) return;
-    for(int x=-15;x<=15;x++) { int px=m_cx+cx+x; if(px<0||px>=LCD_WIDTH) continue;
-        if(abs(ry-(int)(x*a/10.0f))<=1) m_line_buf[px]=0;
-    }
-}
+void FaceRenderer::draw_circle_eye(int fy, int ex, int ey, int r, float open, const expression_params_t& p) {
+    int rel_y = fy - ey;
+    int vis_r = (int)(r * open);
+    if (abs(rel_y) > vis_r + 2) return;
 
-void FaceRenderer::draw_mouth_line(int fy, int cx, int cy, const expression_params_t& p) {
-    int mw=15+(int)(p.mouth_open*5), mh=2+(int)(p.mouth_open*8);
-    int yo=(int)((p.mouth_curve-0.5f)*6), ry=fy-(cy+yo);
-    if(ry<0||ry>=mh) return;
-    for(int x=-mw;x<=mw;x++) { int px=m_cx+cx+x; if(px<0||px>=LCD_WIDTH) continue;
-        float nx=x/(float)mw, ny=ry/(float)mh-0.5f;
-        if(ny*ny+nx*nx*0.5f<=0.5f) m_line_buf[px]=(ry<mh/2)?0x7800:0xF800;
-    }
-}
-
-void FaceRenderer::draw_blush_line(int fy, int cx, int cy, const expression_params_t& p) {
-    if(p.blush<0.05f) return;
-    int br=8+(int)(p.blush*4), ry=fy-cy;
-    if(abs(ry)>br) return;
-    for(int x=-br;x<=br;x++) { int px=m_cx+cx+x; if(px<0||px>=LCD_WIDTH) continue;
-        float d=(x*x+ry*ry)/(float)(br*br);
-        if(d<=1.0f) m_line_buf[px]=0xFD20;
-    }
-}
-
-void FaceRenderer::draw_tears_line(int fy, int cx, int cy, const expression_params_t& p) {
-    if(p.tears<0.05f) return;
-    int n=(int)(p.tears*4);
-    for(int t=0;t<n;t++) { int ty=cy+10+t*6; if(abs(fy-ty)>3) continue;
-        int tx=cx+(t-n/2)*3;
-        for(int x=-1;x<=1;x++) { int px=m_cx+tx+x; if(px<0||px>=LCD_WIDTH) continue;
-            if(abs(fy-ty)<=3) m_line_buf[px]=0x7BEF;
+    for (int x = ex-r-1; x <= ex+r+1; x++) {
+        if (x < 0 || x >= 240) continue;
+        float d = (x-ex)*(x-ex) + rel_y*rel_y;
+        if (d <= r*r) {
+            m_line_buf[x] = 0xFFFF;
+            int px = ex + (int)(p.eye_width * 4 - 1);
+            int py = ey + (int)(p.eye_height * 4 - 1);
+            if ((x-px)*(x-px) + (rel_y-(py-ey))*(rel_y-(py-ey)) <= 25)
+                m_line_buf[x] = 0x0000;
         }
     }
-}
-
-void FaceRenderer::draw_heart_eyes_line(int fy, int cx, int cy, const expression_params_t& p, bool is_left) {
-    (void)p;(void)is_left; int r=7, ry=fy-cy; if(abs(ry)>r) return;
-    for(int x=-r;x<=r;x++) { int px=m_cx+cx+x; if(px<0||px>=LCD_WIDTH) continue;
-        float dx=x/(float)r, dy=ry/(float)r, v=(dx*dx+dy*dy-1);
-        if(v*v*v-dx*dx*dy*dy*dy<0) m_line_buf[px]=0xF800;
+    // Eyelid
+    if (open < 0.8f) {
+        int lid_h = (int)(r * (1.0f - open) * 0.6f);
+        if (abs(rel_y) <= lid_h)
+            for (int x = ex-r-1; x <= ex+r+1; x++)
+                if (x >= 0 && x < 240) m_line_buf[x] = 0xFFDC;
     }
 }

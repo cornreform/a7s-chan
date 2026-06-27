@@ -84,9 +84,6 @@ extern "C" void app_main(void) {
     // Enable peripheral power (GPIO 3 = PWR_EN on CoreS3)
     gpio_set_direction(GPIO_NUM_3, GPIO_MODE_OUTPUT);
     gpio_set_level(GPIO_NUM_3, 1);
-    // Force backlight ON immediately (before any BSP init)
-    gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_38, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Initialize NVS

@@ -27,15 +27,7 @@ private:
     uint32_t m_tween_start;
     uint32_t m_tween_duration;
     uint32_t m_last_blink;
-    uint16_t m_line_buf[LCD_WIDTH];
+    uint16_t m_line_buf[240];
     esp_lcd_panel_handle_t m_panel;
-    int m_cx, m_cy;
-    void draw_face_outline(int fy);
-    void draw_eye_line(int fy, int cx, int cy, const expression_params_t& p, bool l);
-    void draw_pupil(int px, int py, int fy);
-    void draw_eyebrow_line(int fy, int cx, int cy, const expression_params_t& p, bool l);
-    void draw_mouth_line(int fy, int cx, int cy, const expression_params_t& p);
-    void draw_blush_line(int fy, int cx, int cy, const expression_params_t& p);
-    void draw_tears_line(int fy, int cx, int cy, const expression_params_t& p);
-    void draw_heart_eyes_line(int fy, int cx, int cy, const expression_params_t& p, bool l);
+    void draw_circle_eye(int fy, int ex, int ey, int r, float open, const expression_params_t& p);
 };
