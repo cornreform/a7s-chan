@@ -177,9 +177,6 @@ extern "C" void app_main(void) {
     uint32_t last_face_update_ms = 0;
     uint32_t last_led_update_ms = 0;
     uint32_t last_bat_read_ms = 0;
-    uint32_t last_servo_poll_ms = 0;
-
-    ESP_LOGI(TAG, "Entering main loop");
 
     while (1) {
         uint32_t now_ms = esp_timer_get_time() / 1000;
@@ -203,11 +200,6 @@ extern "C" void app_main(void) {
         g_led_control.update(now_ms);
 
         uint32_t last_servo_poll_ms = 0;
-            if (now_ms - last_servo_poll_ms > 500) {
-                last_servo_poll_ms = now_ms;
-                g_servo_control.set_pan(g_servo_control.current_pan);
-                g_servo_control.set_tilt(g_servo_control.current_tilt);
-        // Send status to A7S periodically
         if (s_wifi_connected && (now_ms - last_status_ms > STATUS_INTERVAL_MS)) {
             last_status_ms = now_ms;
 
@@ -232,8 +224,6 @@ extern "C" void app_main(void) {
             read_imu_data(&status);
 
             // Servo state
-            servo_state_t pan_state = g_servo_control.get_state(1);
-            servo_state_t tilt_state = g_servo_control.get_state(2);
             status.servo_pan_pos = pan_state.current_position;
             status.servo_tilt_pos = tilt_state.current_position;
             status.servo_pan_temp = pan_state.temperature;
