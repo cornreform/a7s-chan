@@ -22,9 +22,9 @@ bool FaceRenderer::begin() {
     bsp_display_brightness_init();
     bsp_display_backlight_on();
     esp_lcd_panel_disp_on_off(m_panel, true);
-    // MADCTL: MV=1 (swap), MX=1, MY=1, BGR=1 (all three mirrors)
-    esp_lcd_panel_swap_xy(m_panel, true);
-    esp_lcd_panel_mirror(m_panel, true, true);
+    // BSP default: NO swap_xy, NO mirror (matches official StackChan config)
+    // ILI9342C on CoreS3 operates natively at 320x240
+    // MADCTL defaults to 0x00 from BSP init
     ESP_LOGI(TAG, "Display ready v2.0");
     render();
     return true;
