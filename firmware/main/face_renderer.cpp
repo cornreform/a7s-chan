@@ -22,9 +22,10 @@ bool FaceRenderer::begin() {
     bsp_display_brightness_init();
     bsp_display_backlight_on();
     esp_lcd_panel_disp_on_off(m_panel, true);
-    // BSP default: NO swap_xy, NO mirror (matches official StackChan config)
-    // ILI9342C on CoreS3 operates natively at 320x240
-    // MADCTL defaults to 0x00 from BSP init
+    esp_lcd_panel_swap_xy(m_panel, true);
+    esp_lcd_panel_invert_color(m_panel, false);
+    // BSP invert_color(true) is active - we draw inverted colors
+    esp_lcd_panel_swap_xy(m_panel, true);
     ESP_LOGI(TAG, "Display ready v2.0");
     render();
     return true;
@@ -86,105 +87,63 @@ void FaceRenderer::render() {
     auto& p = m_current_params;
     
     // Eye parameters
-    int eye_r = 32;         // Eye radius (>50% of screen width 240)
-    int eye_spacing = 34;   // Distance from center
-    int eye_y = -15;        // Vertical position
+    int eye_size = 35;       // Half-size of square eye (each ~30% of screen)
+    int eye_spacing = 55;   // Distance from center (no overlap!)
+    int eye_ypos_off = -20;  // move up 20px   // Vertical position relative to m_cx
     int eye_outline_r = 2;  // Outline thickness
     
     // Mouth
-    int mouth_y = 65;
+    int mouth_y = 55;
     
     float eye_open = p.eye_open * (m_eye_state ? 1.0f : 0.15f);
     if (eye_open < 0.05f) eye_open = 0.05f;
     
     uint16_t white = 0xFFFF;
     uint16_t black = 0x0000;
-    uint16_t pupil_c = 0x2104;  // dark gray pupil
-    uint16_t accent = 0x7BEF;   // light gray outline
+    uint16_t pupil_c = 0x2104;
+    uint16_t accent = 0x7BEF;
     
     // After swap_xy: driver swaps x/y internally, MADCTL MV=1 swaps again
     // Double swap = logical/physical match → use 320x240
     int W = 320, H = 240;
-    int cx = W/2, cy = H/2 - 5;
     for (int y = 0; y < H; y++) {
         // Clear line
         for (int x = 0; x < W; x++) m_line_buf[x] = black;
         int fy = y - m_cy;  // -160 to +159
         
         // === EYES (two big circles) ===
-        int cx[2] = {m_cx - eye_spacing, m_cx + eye_spacing};
-        int ey = m_cy + eye_y;
-        int vis_r = (int)(eye_r * eye_open);
-        
-        for (int ei = 0; ei < 2; ei++) {
-            int ex = cx[ei];
-            int rel_y = fy - ey;
-            if (abs(rel_y) > vis_r + eye_outline_r + 1) continue;
-            
-            for (int x = ex - vis_r - eye_outline_r - 1; x <= ex + vis_r + eye_outline_r + 1; x++) {
-                if (x < 0 || x >= W) continue;
-                int dx = x - ex;
-                float d = dx*dx + rel_y*rel_y;
-                
-                // Eye outline (slightly larger circle)
-                if (d <= (vis_r + eye_outline_r) * (vis_r + eye_outline_r) &&
-                    d > vis_r * vis_r) {
-                    m_line_buf[x] = accent;
-                    continue;
-                }
-                
-                // Eye white (main eye)
-                if (d <= vis_r * vis_r) {
-                    m_line_buf[x] = white;
-                    
-                    // Pupil position moves with eye_width/eye_height
-                    int px_off = (int)(p.eye_width * 12 - 6);  // -6 to +6 range
-                    int py_off = (int)(p.eye_height * 12 - 6);
-                    int px = ex + px_off;
-                    int py = ey + py_off;
-                    int pupil_r = (int)(vis_r * 0.4);  // 40% of eye size
-                    
-                    if (dx*dx + rel_y*rel_y <= pupil_r * pupil_r) {
-                        m_line_buf[x] = pupil_c;
-                    }
-                    
-                    // Highlight
-                    int hx = px - (int)(pupil_r * 0.4);
-                    int hy = py - (int)(pupil_r * 0.4);
-                    if ((x-hx)*(x-hx) + (fy-hy)*(fy-hy) <= 4*4) {
-                        m_line_buf[x] = white;
-                    }
-                }
+        // === EYES (two white squares at official positions) ===
+        int es = eye_size;
+        // Right eye center (90,93), Left eye center (230,96), size 70x70
+        int er = 90, el = 230;
+        // Right eye
+        if (y >= 93 - es && y <= 93 + es) {
+            for (int x = er - es; x <= er + es; x++) {
+                if (x >= 0 && x < W) m_line_buf[x] = white;
             }
-            
-            // Eyelid (closing eye)
-            if (eye_open < 0.8f) {
-                int lid_h = (int)(vis_r * (1.0f - eye_open) * 0.5f);
-                if (abs(rel_y) <= lid_h) {
-                    for (int x = ex - vis_r - 2; x <= ex + vis_r + 2; x++)
-                        if (x >= 0 && x < W) m_line_buf[x] = black;
-                }
+            if (abs(y - 93) <= es - 6) {  // pupil
+                int ps = es - 6;
+                for (int x = er - ps; x <= er + ps; x++)
+                    if (x >= 0 && x < W) m_line_buf[x] = pupil_c;
             }
         }
-        
-        // === MOUTH (thin horizontal line) ===
-        int mouth_ey = m_cy + mouth_y;
-        int mw = 15 + (int)(p.mouth_open * 12);    // mouth width varies
-        int mh = 1 + (int)(p.mouth_open * 3);       // height varies
-        int curve = (int)((p.mouth_curve - 0.5f) * 8);  // -4 to +4
-        
-        if (abs(fy - mouth_ey) <= mh) {
-            int ly = fy - mouth_ey + curve;
-            if (abs(ly) <= mh) {
-                for (int x = m_cx - mw; x <= m_cx + mw; x++) {
-                    if (x >= 0 && x < W) {
-                        m_line_buf[x] = white;
-                    }
-                }
+        // Left eye
+        if (y >= 96 - es && y <= 96 + es) {
+            for (int x = el - es; x <= el + es; x++) {
+                if (x >= 0 && x < W) m_line_buf[x] = white;
+            }
+            if (abs(y - 96) <= es - 6) {  // pupil
+                int ps = es - 6;
+                for (int x = el - ps; x <= el + ps; x++)
+                    if (x >= 0 && x < W) m_line_buf[x] = pupil_c;
             }
         }
-        
-        // Draw row
+        // === MOUTH (horizontal line at Y=190, X=160) ===
+        if (y >= 189 && y <= 191) {
+            for (int x = 160 - 25; x <= 160 + 25; x++) {
+                if (x >= 0 && x < W) m_line_buf[x] = white;
+            }
+        }
         esp_lcd_panel_draw_bitmap(m_panel, 0, y, W, y+1, m_line_buf);
     }
 }
